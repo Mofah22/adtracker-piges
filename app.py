@@ -75,7 +75,11 @@ def is_date_val(val):
     return bool(re.search(r'\d{1,2}[/-]\d{1,2}|\d{4}-\d{2}-\d{2}', s))
 
 def standardize_pm_columns(df):
-    """Standardise les colonnes d'un PM (vertical ou après redressement)."""
+    """
+    Standardise les colonnes d'un PM en évitant les doublons (Date, Heure, etc.).
+    Fix principal pour l'erreur: 'DataFrame' object has no attribute 'dtype'
+    (arrive quand df['Date'] renvoie un DataFrame à cause de colonnes dupliquées).
+    """
     def find_col(keys):
         for c in df.columns:
             cl = str(c).lower().strip()
@@ -90,14 +94,25 @@ def standardize_pm_columns(df):
     col_code   = find_col(['code', 'ecran', 'écran'])
 
     rename = {}
-    if col_date:   rename[col_date] = 'Date'
-    if col_heure:  rename[col_heure] = 'Heure'
-    if col_marque: rename[col_marque] = 'Marque'
-    if col_sup:    rename[col_sup] = 'Support'
-    if col_code:   rename[col_code] = 'Code_Ecran'
+
+    # ⚠️ Ne pas renommer vers un nom qui existe déjà => évite Date en double, etc.
+    if col_date and 'Date' not in df.columns:
+        rename[col_date] = 'Date'
+    if col_heure and 'Heure' not in df.columns:
+        rename[col_heure] = 'Heure'
+    if col_marque and 'Marque' not in df.columns:
+        rename[col_marque] = 'Marque'
+    if col_sup and 'Support' not in df.columns:
+        rename[col_sup] = 'Support'
+    if col_code and 'Code_Ecran' not in df.columns:
+        rename[col_code] = 'Code_Ecran'
 
     df2 = df.rename(columns=rename).copy()
 
+    # ✅ Supprimer toutes colonnes dupliquées (garder la 1ère occurrence)
+    df2 = df2.loc[:, ~df2.columns.duplicated()].copy()
+
+    # Conversions safe
     if 'Date' in df2.columns:
         df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce')
     if 'Heure' in df2.columns:
@@ -106,8 +121,9 @@ def standardize_pm_columns(df):
     return df2
 
 def transform_pm_horizontal(df):
-    """Détecte et redresse un PM horizontal (dates en colonnes) en format vertical.
-       Si déjà vertical, standardise juste les colonnes.
+    """
+    Détecte et redresse un PM horizontal (dates en colonnes) en format vertical.
+    Si déjà vertical, standardise juste les colonnes.
     """
     header_idx = -1
     for i in range(min(len(df), 25)):
@@ -127,20 +143,24 @@ def transform_pm_horizontal(df):
     meta_cols = [c for c in df.columns if not is_date_val(c)]
     date_cols = [c for c in df.columns if is_date_val(c)]
 
-    df_vert = df.melt(id_vars=meta_cols, value_vars=date_cols, var_name='Date', value_name='Code_Ecran')
+    df_vert = df.melt(
+        id_vars=meta_cols,
+        value_vars=date_cols,
+        var_name='Date',
+        value_name='Code_Ecran'
+    )
 
     df_vert = df_vert.dropna(subset=['Code_Ecran'])
     df_vert = df_vert[~df_vert['Code_Ecran'].astype(str).str.strip().isin(['0', '', 'nan', 'None'])]
 
-    # Standardisation finale
+    # Standardisation finale + anti-doublons
     df_vert = standardize_pm_columns(df_vert)
 
-    # Assurer le nom Code_Ecran si la colonne s'appelle Code_Ecran déjà OK
     if 'Code_Ecran' not in df_vert.columns:
-        # fallback
         if 'Code Ecran' in df_vert.columns:
             df_vert = df_vert.rename(columns={'Code Ecran': 'Code_Ecran'})
 
+    df_vert = df_vert.loc[:, ~df_vert.columns.duplicated()].copy()
     return df_vert
 
 # =========================================================
@@ -196,7 +216,6 @@ def apply_template(writer, sheet_name, df):
 
 def reconcile_all(df_brute, df_pm_total):
 
-    # Standardisation de la Data Brute (recherche par mots-clés)
     def find_col(df, keys):
         for c in df.columns:
             col_low = str(c).lower().strip()
@@ -217,11 +236,15 @@ def reconcile_all(df_brute, df_pm_total):
             raise ValueError(f"La colonne '{k}' est introuvable dans la Data Brute.")
 
     df_b = df_brute.rename(columns={v: k for k, v in br_map.items() if v}).copy()
+    # ✅ Anti-doublons côté Data Brute aussi
+    df_b = df_b.loc[:, ~df_b.columns.duplicated()].copy()
+
     df_b['Date'] = pd.to_datetime(df_b['Date'], errors='coerce')
     df_b['Heure'] = df_b['Heure'].apply(parse_time)
 
-    # Sécuriser le PM : il doit avoir Date/Heure/Marque/Support/Code_Ecran
+    # Sécuriser le PM
     df_pm_total = standardize_pm_columns(df_pm_total)
+    df_pm_total = df_pm_total.loc[:, ~df_pm_total.columns.duplicated()].copy()
 
     if 'Date' not in df_pm_total.columns:
         raise ValueError("Le PM unifié ne contient pas de colonne 'Date' après standardisation.")
@@ -247,7 +270,6 @@ def reconcile_all(df_brute, df_pm_total):
             s_b = b_m[b_m['Support'] == s].sort_values(['Date', 'Heure'])
             s_p = p_m[p_m['Support'] == s].sort_values(['Date', 'Heure'])
 
-            # Toutes les dates présentes dans les deux
             dates = sorted(list(
                 set(s_b['Date'].dt.date.dropna().unique()) |
                 set(s_p['Date'].dt.date.dropna().unique())
@@ -258,7 +280,6 @@ def reconcile_all(df_brute, df_pm_total):
                 day_p = s_p[s_p['Date'].dt.date == d]
                 used_p_idx = []
 
-                # Matching Réalisé -> PM (Ordre Chronologique)
                 for _, r in day_b.iterrows():
                     avail = day_p[~day_p.index.isin(used_p_idx)]
                     row_data = r.to_dict()
@@ -267,10 +288,8 @@ def reconcile_all(df_brute, df_pm_total):
                         p_match = avail.iloc[0]
                         used_p_idx.append(avail.index[0])
 
-                        # code écran PM
                         row_data['Code Ecran PM'] = p_match.get('Code_Ecran', '')
 
-                        # Décalage 45 min
                         tr, tp = parse_time(r.get('Heure')), parse_time(p_match.get('Heure'))
                         if tr and tp:
                             dummy = datetime.today()
@@ -284,7 +303,6 @@ def reconcile_all(df_brute, df_pm_total):
 
                     client_results.append(row_data)
 
-                # Non diffusés : spots PM non utilisés
                 remaining = day_p[~day_p.index.isin(used_p_idx)]
                 for _, p in remaining.iterrows():
                     nd_row = {
@@ -327,29 +345,20 @@ with col_up1:
 with col_up2:
     brute_in = st.file_uploader("📊 Uploader la Data Brute (Pige cabinet)")
 
-# Debug optionnel (mets True si tu veux voir les colonnes)
-DEBUG_COLUMNS = False
-
 if st.button("LANCER LE TRAITEMENT", use_container_width=True):
     if pm_in and brute_in:
         try:
             with st.spinner("Analyse et réconciliation en cours..."):
-                # Lecture Data Brute
                 df_brute_raw = pd.read_excel(brute_in)
 
-                # Lecture + transformation PM (horizontal/vertical)
                 pms_vertical = []
                 for f in pm_in:
                     df_pm_raw = pd.read_excel(f)
                     pms_vertical.append(transform_pm_horizontal(df_pm_raw))
 
                 df_pm_unified = pd.concat(pms_vertical, ignore_index=True)
+                df_pm_unified = df_pm_unified.loc[:, ~df_pm_unified.columns.duplicated()].copy()
 
-                if DEBUG_COLUMNS:
-                    st.write("Colonnes PM unifiées:", list(df_pm_unified.columns))
-                    st.write("Colonnes Data Brute:", list(df_brute_raw.columns))
-
-                # Exécution moteur
                 final_outputs = reconcile_all(df_brute_raw, df_pm_unified)
 
                 if final_outputs:
@@ -373,4 +382,4 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         st.warning("Veuillez charger les fichiers nécessaires.")
 
 st.divider()
-st.caption("AdTracker Pro v2.6 - Outil interne d'agence média | Marché Maroc.")
+st.caption("AdTracker Pro v2.7 - Outil interne d'agence média | Marché Maroc.")
