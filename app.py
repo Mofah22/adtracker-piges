@@ -6,6 +6,11 @@ import re
 from datetime import datetime, time, date
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
+# ==========================
+# MODE DEBUG (mets False après)
+# ==========================
+DEBUG = True
+
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(
     page_title="AdTracker Pro - Maroc",
@@ -48,6 +53,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Nettoie/flatten les colonnes (y compris MultiIndex) pour éviter bugs dtype."""
     df = df.copy()
 
+    # Flatten MultiIndex si présent
     if isinstance(df.columns, pd.MultiIndex):
         new_cols = []
         for tup in df.columns:
@@ -60,7 +66,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # Nettoyage “Unnamed”
     df.columns = [re.sub(r"^Unnamed:.*$", "", c).strip() for c in df.columns]
-    # Si certains noms deviennent vides, on les remplace
+
+    # Remplacer colonnes vides
     fixed = []
     for i, c in enumerate(df.columns):
         fixed.append(c if c else f"COL_{i}")
@@ -109,12 +116,23 @@ def is_date_val(val):
     s = str(val).strip()
     return bool(re.search(r'\d{1,2}[/-]\d{1,2}|\d{4}-\d{2}-\d{2}', s))
 
+def debug_cols(title: str, df: pd.DataFrame):
+    """Affiche colonnes + doublons + dtypes en mode DEBUG."""
+    if not DEBUG:
+        return
+    df2 = normalize_columns(df)
+    dups = pd.Index(df2.columns)[pd.Index(df2.columns).duplicated()].tolist()
+    st.write(f"### {title}")
+    st.write("Colonnes:", list(df2.columns))
+    st.write("Doublons:", dups)
+    st.write("dtypes:", df2.dtypes.astype(str))
+
 # =========================================================
 # --- STANDARDISATION PM ---
 # =========================================================
 
 def standardize_pm_columns(df):
-    """Standardise PM (Date/Heure/Marque/Support/Code_Ecran) + anti-doublons + conversions safe."""
+    """Standardise PM (Date/Heure/Marque/Support/Code_Ecran) + conversions safe."""
     df = normalize_columns(df)
 
     def find_col(keys):
@@ -138,10 +156,10 @@ def standardize_pm_columns(df):
     if col_code:   rename[col_code] = 'Code_Ecran'
 
     df2 = df.rename(columns=rename).copy()
-    # Supprimer colonnes dupliquées (même après flatten)
+    # Supprimer colonnes dupliquées (garder la 1ère)
     df2 = df2.loc[:, ~pd.Index(df2.columns).duplicated()].copy()
 
-    # Conversions SAFE (Date/Heure toujours Série)
+    # Conversions SAFE (Series garantie)
     s_date = get_series(df2, 'Date')
     if s_date is not None:
         df2['Date'] = pd.to_datetime(s_date, errors='coerce')
@@ -167,7 +185,7 @@ def transform_pm_horizontal(df):
         return standardize_pm_columns(df)
 
     # Horizontal -> vertical
-    df.columns = [c if str(c).strip() != "" else f"Info_{i}" for i, c in enumerate(df.iloc[header_idx])]
+    df.columns = [c if str(c).strip() else f"Info_{i}" for i, c in enumerate(df.iloc[header_idx])]
     df = df.iloc[header_idx + 1:].reset_index(drop=True)
     df = normalize_columns(df)
 
@@ -233,7 +251,6 @@ def apply_template(writer, sheet_name, df):
 # =========================================================
 
 def reconcile_all(df_brute, df_pm_total):
-
     df_brute = normalize_columns(df_brute)
     df_pm_total = standardize_pm_columns(df_pm_total)
 
@@ -326,7 +343,7 @@ def reconcile_all(df_brute, df_pm_total):
                         'Date': d,
                         'Support': s,
                         'Marque': m,
-                        'Code Ecran PM': p.get('Code_Ecran', ''),
+                        'Code Ecran PM': p_match.get('Code_Ecran', '') if 'p_match' in locals() else p.get('Code_Ecran', ''),
                         'Commentaire': 'Non diffusé'
                     }
                     for col in df_b.columns:
@@ -366,16 +383,26 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
     if pm_in and brute_in:
         try:
             with st.spinner("Analyse et réconciliation en cours..."):
-                df_brute_raw = pd.read_excel(brute_in)
-                df_brute_raw = normalize_columns(df_brute_raw)
 
+                # Lecture Data Brute
+                df_brute_raw = pd.read_excel(brute_in, header=0)
+                df_brute_raw = normalize_columns(df_brute_raw)
+                debug_cols("DATA BRUTE (après lecture)", df_brute_raw)
+
+                # Lecture + transformation PM
                 pms_vertical = []
                 for f in pm_in:
-                    df_pm_raw = pd.read_excel(f)
-                    pms_vertical.append(transform_pm_horizontal(df_pm_raw))
+                    df_pm_raw = pd.read_excel(f, header=0)
+                    df_pm_raw = normalize_columns(df_pm_raw)
+                    debug_cols(f"PM RAW ({getattr(f, 'name', 'PM')})", df_pm_raw)
+
+                    pmv = transform_pm_horizontal(df_pm_raw)
+                    debug_cols(f"PM VERTICAL ({getattr(f, 'name', 'PM')})", pmv)
+                    pms_vertical.append(pmv)
 
                 df_pm_unified = pd.concat(pms_vertical, ignore_index=True)
                 df_pm_unified = standardize_pm_columns(df_pm_unified)
+                debug_cols("PM UNIFIÉ (standardisé)", df_pm_unified)
 
                 final_outputs = reconcile_all(df_brute_raw, df_pm_unified)
 
@@ -396,8 +423,11 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
                     st.warning("Aucune correspondance trouvée. Vérifiez que les noms des marques et supports sont identiques dans vos fichiers.")
         except Exception as e:
             st.error(f"Une erreur est survenue lors du traitement : {e}")
+            if DEBUG:
+                import traceback
+                st.code(traceback.format_exc())
     else:
         st.warning("Veuillez charger les fichiers nécessaires.")
 
 st.divider()
-st.caption("AdTracker Pro v2.8 - Outil interne d'agence média | Marché Maroc.")
+st.caption("AdTracker Pro v2.9 (DEBUG) - Outil interne d'agence média | Marché Maroc.")
