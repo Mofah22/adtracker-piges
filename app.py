@@ -6,19 +6,10 @@ import re
 from datetime import datetime, time, date
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
-# ==========================
-# MODE DEBUG (mets False après)
-# ==========================
 DEBUG = True
 
-# --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(
-    page_title="AdTracker Pro - Maroc",
-    page_icon="🇲🇦",
-    layout="wide"
-)
+st.set_page_config(page_title="AdTracker Pro - Maroc", page_icon="🇲🇦", layout="wide")
 
-# --- STYLES CSS POUR L'INTERFACE ---
 st.markdown("""
     <style>
     .main { background-color: #f8fafc; }
@@ -32,10 +23,7 @@ st.markdown("""
         border: none;
         transition: all 0.3s;
     }
-    .stButton>button:hover {
-        background-color: #5b6eae;
-        transform: translateY(-2px);
-    }
+    .stButton>button:hover { background-color: #5b6eae; transform: translateY(-2px); }
     .stDownloadButton>button {
         width: 100%;
         border-radius: 8px;
@@ -43,43 +31,51 @@ st.markdown("""
         color: white !important;
     }
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # =========================================================
-# --- OUTILS ROBUSTES (FIX dtype) ---
+# Helpers
 # =========================================================
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Nettoie/flatten les colonnes (y compris MultiIndex) pour éviter bugs dtype."""
+    """Aplatit MultiIndex et nettoie les noms de colonnes."""
     df = df.copy()
 
-    # Flatten MultiIndex si présent
     if isinstance(df.columns, pd.MultiIndex):
         new_cols = []
         for tup in df.columns:
             parts = [str(x).strip() for x in tup if x is not None and str(x).strip().lower() != "nan"]
-            col = " ".join(parts).strip() if parts else ""
-            new_cols.append(col)
+            new_cols.append(" ".join(parts).strip() if parts else "")
         df.columns = new_cols
     else:
         df.columns = [str(c).strip() for c in df.columns]
 
-    # Nettoyage “Unnamed”
     df.columns = [re.sub(r"^Unnamed:.*$", "", c).strip() for c in df.columns]
-
-    # Remplacer colonnes vides
-    fixed = []
-    for i, c in enumerate(df.columns):
-        fixed.append(c if c else f"COL_{i}")
-    df.columns = fixed
-
+    df.columns = [c if c else f"COL_{i}" for i, c in enumerate(df.columns)]
     return df
 
+def make_unique_columns(cols):
+    """
+    Rend les colonnes uniques.
+    Si une colonne est dupliquée, ajoute __2, __3...
+    """
+    seen = {}
+    out = []
+    for c in cols:
+        base = str(c).strip()
+        if base in seen:
+            seen[base] += 1
+            out.append(f"{base}__{seen[base]}")
+        else:
+            seen[base] = 1
+            out.append(base)
+    return out
+
+def strip_dup_suffix(x: str) -> str:
+    """Enlève suffixe __2/__3..."""
+    return re.sub(r"__\d+$", "", str(x))
+
 def get_series(df: pd.DataFrame, col: str):
-    """
-    Retourne toujours une Série.
-    Si df[col] renvoie un DataFrame (doublons/MultiIndex), on prend la 1ère colonne.
-    """
     if col not in df.columns:
         return None
     x = df[col]
@@ -88,14 +84,12 @@ def get_series(df: pd.DataFrame, col: str):
     return x
 
 def parse_time(t):
-    """Convertit divers formats d'heure (20h30, 20:30, float Excel) en objet time."""
     if pd.isna(t) or str(t).strip() == "":
         return None
     if isinstance(t, time):
         return t
     if isinstance(t, datetime):
         return t.time()
-
     if isinstance(t, (float, int)):
         seconds = int(round(float(t) * 86400))
         seconds = max(0, min(seconds, 86399))
@@ -110,29 +104,25 @@ def parse_time(t):
     return None
 
 def is_date_val(val):
-    """Vérifie si une valeur ressemble à une date."""
     if isinstance(val, (datetime, date, pd.Timestamp)):
         return True
     s = str(val).strip()
     return bool(re.search(r'\d{1,2}[/-]\d{1,2}|\d{4}-\d{2}-\d{2}', s))
 
 def debug_cols(title: str, df: pd.DataFrame):
-    """Affiche colonnes + doublons + dtypes en mode DEBUG."""
     if not DEBUG:
         return
-    df2 = normalize_columns(df)
-    dups = pd.Index(df2.columns)[pd.Index(df2.columns).duplicated()].tolist()
     st.write(f"### {title}")
-    st.write("Colonnes:", list(df2.columns))
+    st.write("Colonnes:", list(df.columns))
+    dups = pd.Index(df.columns)[pd.Index(df.columns).duplicated()].tolist()
     st.write("Doublons:", dups)
-    st.write("dtypes:", df2.dtypes.astype(str))
+    st.write("dtypes:", df.dtypes.astype(str))
 
 # =========================================================
-# --- STANDARDISATION PM ---
+# Standardisation PM
 # =========================================================
 
-def standardize_pm_columns(df):
-    """Standardise PM (Date/Heure/Marque/Support/Code_Ecran) + conversions safe."""
+def standardize_pm_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(df)
 
     def find_col(keys):
@@ -156,10 +146,8 @@ def standardize_pm_columns(df):
     if col_code:   rename[col_code] = 'Code_Ecran'
 
     df2 = df.rename(columns=rename).copy()
-    # Supprimer colonnes dupliquées (garder la 1ère)
     df2 = df2.loc[:, ~pd.Index(df2.columns).duplicated()].copy()
 
-    # Conversions SAFE (Series garantie)
     s_date = get_series(df2, 'Date')
     if s_date is not None:
         df2['Date'] = pd.to_datetime(s_date, errors='coerce')
@@ -170,8 +158,11 @@ def standardize_pm_columns(df):
 
     return df2
 
-def transform_pm_horizontal(df):
-    """Détecte PM horizontal -> vertical. Sinon retourne PM vertical standardisé."""
+def transform_pm_horizontal(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect PM horizontal (dates en colonnes) -> melt.
+    FIX important : rendre colonnes uniques avant melt pour éviter bug dtype.
+    """
     df = normalize_columns(df)
 
     header_idx = -1
@@ -181,43 +172,61 @@ def transform_pm_horizontal(df):
             header_idx = i
             break
 
+    # PM déjà vertical
     if header_idx == -1:
         return standardize_pm_columns(df)
 
-    # Horizontal -> vertical
-    df.columns = [c if str(c).strip() else f"Info_{i}" for i, c in enumerate(df.iloc[header_idx])]
+    # Recréer les colonnes depuis la ligne calendrier
+    raw_cols = []
+    for x in df.iloc[header_idx].tolist():
+        if isinstance(x, (datetime, date, pd.Timestamp)):
+            raw_cols.append(pd.to_datetime(x).strftime("%Y-%m-%d"))
+        else:
+            raw_cols.append(str(x).strip())
+
+    # Colonnes uniques (clé du fix)
+    df.columns = make_unique_columns([c if c else "COL" for c in raw_cols])
+
+    # Données sous le header
     df = df.iloc[header_idx + 1:].reset_index(drop=True)
-    df = normalize_columns(df)
 
-    meta_cols = [c for c in df.columns if not is_date_val(c)]
-    date_cols = [c for c in df.columns if is_date_val(c)]
+    # Nettoyage basique
+    df = df.dropna(how="all")
+    df = df.copy()
 
+    # Séparer meta vs dates (dates sont souvent des strings "YYYY-MM-DD" ou "dd/mm")
+    meta_cols = [c for c in df.columns if not is_date_val(strip_dup_suffix(c))]
+    date_cols = [c for c in df.columns if is_date_val(strip_dup_suffix(c))]
+
+    # ⭐ Fix final : melt sur colonnes uniques
     df_vert = df.melt(
         id_vars=meta_cols,
         value_vars=date_cols,
-        var_name='Date',
-        value_name='Code_Ecran'
+        var_name="Date",
+        value_name="Code_Ecran"
     )
 
-    df_vert = df_vert.dropna(subset=['Code_Ecran'])
-    df_vert = df_vert[~df_vert['Code_Ecran'].astype(str).str.strip().isin(['0', '', 'nan', 'None'])]
+    # Retirer suffixe des dates puis convertir
+    df_vert["Date"] = df_vert["Date"].apply(strip_dup_suffix)
+    df_vert["Date"] = pd.to_datetime(df_vert["Date"], errors="coerce")
 
+    # Nettoyage spots vides
+    df_vert = df_vert.dropna(subset=["Code_Ecran"])
+    df_vert = df_vert[~df_vert["Code_Ecran"].astype(str).str.strip().isin(["0", "", "nan", "None"])]
+
+    # Standardisation finale
     return standardize_pm_columns(df_vert)
 
 # =========================================================
-# --- EXCEL TEMPLATE ---
+# Excel template
 # =========================================================
 
 def apply_template(writer, sheet_name, df):
     ws = writer.sheets[sheet_name]
     blue_fill = PatternFill(start_color='7289DA', end_color='7289DA', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
-    border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
-    )
+    border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin'))
 
     ws["A4"], ws["B4"] = "DATE GÉNÉRATION :", datetime.now().strftime("%d/%m/%Y")
     ws["A5"], ws["B5"] = "CLIENT :", str(df['Marque'].iloc[0]) if 'Marque' in df.columns and not df.empty else "N/A"
@@ -247,7 +256,7 @@ def apply_template(writer, sheet_name, df):
         ws.column_dimensions[col[0].column_letter].width = 22
 
 # =========================================================
-# --- LOGIQUE DE RÉCONCILIATION ---
+# Reconciliation
 # =========================================================
 
 def reconcile_all(df_brute, df_pm_total):
@@ -268,7 +277,6 @@ def reconcile_all(df_brute, df_pm_total):
         'Support': find_col(df_brute, ['support', 'chaîne', 'chaine', 'station']),
         'Code': find_col(df_brute, ['code', 'ecran', 'écran'])
     }
-
     for k, v in br_map.items():
         if v is None:
             raise ValueError(f"La colonne '{k}' est introuvable dans la Data Brute.")
@@ -276,17 +284,10 @@ def reconcile_all(df_brute, df_pm_total):
     df_b = df_brute.rename(columns={v: k for k, v in br_map.items() if v}).copy()
     df_b = df_b.loc[:, ~pd.Index(df_b.columns).duplicated()].copy()
 
-    # conversions safe
     s_date = get_series(df_b, 'Date')
     df_b['Date'] = pd.to_datetime(s_date, errors='coerce') if s_date is not None else pd.NaT
-
     s_heure = get_series(df_b, 'Heure')
     df_b['Heure'] = s_heure.apply(parse_time) if s_heure is not None else None
-
-    # checks
-    for req in ['Date', 'Marque', 'Support']:
-        if req not in df_pm_total.columns:
-            raise ValueError(f"Le PM unifié ne contient pas '{req}' après standardisation.")
 
     output_files = {}
     marques = df_b['Marque'].dropna().unique()
@@ -321,7 +322,6 @@ def reconcile_all(df_brute, df_pm_total):
                     if not avail.empty:
                         p_match = avail.iloc[0]
                         used_p_idx.append(avail.index[0])
-
                         row_data['Code Ecran PM'] = p_match.get('Code_Ecran', '')
 
                         tr, tp = parse_time(r.get('Heure')), parse_time(p_match.get('Heure'))
@@ -343,7 +343,7 @@ def reconcile_all(df_brute, df_pm_total):
                         'Date': d,
                         'Support': s,
                         'Marque': m,
-                        'Code Ecran PM': p_match.get('Code_Ecran', '') if 'p_match' in locals() else p.get('Code_Ecran', ''),
+                        'Code Ecran PM': p.get('Code_Ecran', ''),
                         'Commentaire': 'Non diffusé'
                     }
                     for col in df_b.columns:
@@ -353,7 +353,6 @@ def reconcile_all(df_brute, df_pm_total):
 
         if client_results:
             df_final_client = pd.DataFrame(client_results)
-
             bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine='openpyxl') as writer:
                 for sup in df_final_client['Support'].dropna().unique():
@@ -361,13 +360,12 @@ def reconcile_all(df_brute, df_pm_total):
                     sheet = str(sup)[:30] if str(sup).strip() else "Support"
                     dfs.to_excel(writer, index=False, sheet_name=sheet, startrow=8)
                     apply_template(writer, sheet, dfs)
-
             output_files[m] = bio.getvalue()
 
     return output_files
 
 # =========================================================
-# --- INTERFACE STREAMLIT ---
+# UI
 # =========================================================
 
 st.title("🇲🇦 AdTracker Pro : Media Reconciler")
@@ -384,12 +382,10 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         try:
             with st.spinner("Analyse et réconciliation en cours..."):
 
-                # Lecture Data Brute
                 df_brute_raw = pd.read_excel(brute_in, header=0)
                 df_brute_raw = normalize_columns(df_brute_raw)
-                debug_cols("DATA BRUTE (après lecture)", df_brute_raw)
+                debug_cols("DATA BRUTE", df_brute_raw)
 
-                # Lecture + transformation PM
                 pms_vertical = []
                 for f in pm_in:
                     df_pm_raw = pd.read_excel(f, header=0)
@@ -402,14 +398,13 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
 
                 df_pm_unified = pd.concat(pms_vertical, ignore_index=True)
                 df_pm_unified = standardize_pm_columns(df_pm_unified)
-                debug_cols("PM UNIFIÉ (standardisé)", df_pm_unified)
+                debug_cols("PM UNIFIÉ", df_pm_unified)
 
                 final_outputs = reconcile_all(df_brute_raw, df_pm_unified)
 
                 if final_outputs:
                     st.success(f"✅ {len(final_outputs)} clients traités avec succès.")
                     st.divider()
-
                     grid = st.columns(3)
                     for i, (client_name, data) in enumerate(final_outputs.items()):
                         with grid[i % 3]:
@@ -430,4 +425,4 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         st.warning("Veuillez charger les fichiers nécessaires.")
 
 st.divider()
-st.caption("AdTracker Pro v2.9 (DEBUG) - Outil interne d'agence média | Marché Maroc.")
+st.caption("AdTracker Pro v3.0 - Outil interne d'agence média | Marché Maroc.")
