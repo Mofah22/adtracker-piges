@@ -2,7 +2,7 @@ import io
 import re
 import zipfile
 import unicodedata
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -12,7 +12,7 @@ from copy import copy as pycopy
 # =========================
 # CONFIG
 # =========================
-TEMPLATE_PATH = "TEMPLATE_SUIVI_FINAL.xlsx"  # doit exister dans le repo
+TEMPLATE_PATH = "TEMPLATE_SUIVI_FINAL.xlsx"  # dans le repo
 HEADER_ROW = 9
 DATA_START_ROW = 10
 
@@ -32,6 +32,8 @@ FINAL_COLUMNS = [
     "rangE",
     "encombE",
 ]
+
+DECALAGE_MINUTES = 45
 
 st.set_page_config(page_title="Suivi Pige — Automatisation", page_icon="📊", layout="wide")
 
@@ -57,7 +59,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# STATE (pour éviter disparition après download)
+# STATE (pour ne pas perdre les résultats après download)
 # =========================
 if "client_files" not in st.session_state:
     st.session_state.client_files = None
@@ -107,7 +109,7 @@ def to_excel_time(val):
     except:
         pass
 
-    # excel float
+    # excel float hour
     if isinstance(val, (float, int)):
         seconds = int(round(float(val) * 86400))
         seconds = max(0, min(seconds, 86399))
@@ -175,6 +177,7 @@ def is_date_like(v):
     return bool(re.search(r"\d{4}-\d{2}-\d{2}", s)) or bool(re.search(r"\d{1,2}[/-]\d{1,2}", s))
 
 def extract_marque_from_filename(fname: str) -> str:
+    # PM GATO RAMADAN ... -> GATO
     base = fname.rsplit(".", 1)[0]
     base = base.replace("_", " ")
     base = re.sub(r"\s+", " ", base).strip()
@@ -184,6 +187,10 @@ def extract_marque_from_filename(fname: str) -> str:
     return re.sub(r"\s+", " ", marque).strip()
 
 def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
+    """
+    PM grille -> vertical :
+    Date | supportp | Marque | Code PM | Heure_PM
+    """
     df = df_raw.copy()
 
     def row_has(i, keywords):
@@ -191,6 +198,7 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
         row_norm = [norm_txt(x) for x in row]
         return any(any(k in cell for k in keywords) for cell in row_norm)
 
+    # meta header row
     meta_header_row = None
     for i in range(min(len(df), 80)):
         if row_has(i, ["CHAINE"]) and row_has(i, ["ECRAN"]) and row_has(i, ["TRANCHE", "HORAIRE", "PROGRAMME", "AVANT", "APRES", "APRÈS"]):
@@ -199,6 +207,7 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
     if meta_header_row is None:
         raise ValueError(f"PM ({pm_filename}): ligne d’en-têtes introuvable.")
 
+    # date row
     date_header_row = None
     for i in range(meta_header_row, min(len(df), meta_header_row + 40)):
         row_vals = df.iloc[i].tolist()
@@ -262,7 +271,7 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
     return pmv
 
 # =========================
-# Data Imperium -> Final + Matching PM
+# Data Imperium -> Final
 # =========================
 
 def find_column(df: pd.DataFrame, candidates: list[str]):
@@ -289,7 +298,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out = pd.DataFrame()
     out["datep"] = df["datep"]
     out["supportp"] = df[col_sup].astype(str).str.strip()
-    out["heure de diffusion"] = df[col_time]  # converti lors de l’écriture
+    out["heure de diffusion"] = df[col_time]  # converti plus tard
     out["Marque"] = df[col_mar].astype(str).str.strip()
 
     # optionals
@@ -307,78 +316,243 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
 
     return out[FINAL_COLUMNS]
 
-def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, decalage_min=45):
+# =========================
+# PM vs Réalisé — moteur final
+# =========================
+
+def match_day(real_day: pd.DataFrame, pm_day: pd.DataFrame):
+    """
+    real_day: lignes réelles du jour (déjà triées)
+    pm_day: lignes PM du jour (avec Code PM + Heure_PM)
+    Retour:
+      - df_real_filled (mêmes lignes réelles avec Code PM + Commentaire)
+      - df_non_diffuse (lignes à insérer: Non diffusé)
+      - backlog_non_diffuse_count (nb non diffusés restants pour compensation)
+    """
+    real = real_day.copy()
+    pm = pm_day.copy()
+
+    real["time_real"] = real["heure de diffusion"].apply(to_excel_time)
+    pm = pm.sort_values("Heure_PM")
+
+    used_pm = set()
+
+    # Préparer sorties
+    filled_rows = []
+    non_diffuse_rows = []
+
+    n_real = len(real)
+    n_pm = len(pm)
+
+    # Helper: meilleur pm par proximité (one-to-one)
+    def pick_closest_pm(avail_pm: pd.DataFrame, t_real: time):
+        if avail_pm.empty:
+            return None, None
+        if t_real is None:
+            pick = avail_pm.iloc[0]
+            return pick, None
+        tmp = avail_pm.copy()
+        tmp["diff"] = tmp["Heure_PM"].apply(lambda t: minutes_diff(t_real, t) if t else 999999)
+        pick = tmp.sort_values("diff").iloc[0]
+        return pick, float(pick["diff"]) if "diff" in pick else None
+
+    # CASE 1: égal => ordre chrono strict
+    if n_real == n_pm:
+        pm_iter = pm.itertuples()
+        for r, p in zip(real.itertuples(index=False), pm_iter):
+            # r est un namedtuple; on reconstruit en dict depuis la ligne source
+            row = real.loc[real.index[0]].copy()  # dummy
+            row = real.loc[getattr(r, "Index", None)] if hasattr(r, "Index") else None
+
+        # plus simple: boucle indexée
+        pm_list = list(pm.itertuples(index=False))
+        for i in range(n_real):
+            rrow = real.iloc[i].copy()
+            prow = pm_list[i]
+            codepm = getattr(prow, "Code_PM".replace(" ", "_"), None)
+            if codepm is None:
+                codepm = getattr(prow, "Code PM", None) if hasattr(prow, "Code PM") else prow[pm.columns.get_loc("Code PM")]
+            tpm = prow[pm.columns.get_loc("Heure_PM")] if "Heure_PM" in pm.columns else None
+            treal = rrow["time_real"]
+
+            # Commentaire: Décalage uniquement si diff > 45
+            comment = None
+            if treal is not None and tpm is not None:
+                diff = minutes_diff(treal, tpm)
+                if diff is not None and diff > DECALAGE_MINUTES:
+                    comment = "Décalage"
+
+            rrow["Code PM"] = pm.iloc[i]["Code PM"]
+            rrow["Commentaire"] = comment
+            filled_rows.append(rrow)
+
+        return pd.DataFrame(filled_rows), pd.DataFrame(non_diffuse_rows), 0
+
+    # CASE 2: moins de diffusions => plus proche + non diffusé
+    if n_real < n_pm:
+        for i in range(n_real):
+            rrow = real.iloc[i].copy()
+            treal = rrow["time_real"]
+
+            avail = pm.loc[~pm.index.isin(used_pm)]
+            pick, diff = pick_closest_pm(avail, treal)
+
+            if pick is not None:
+                used_pm.add(pick.name)
+                rrow["Code PM"] = pick["Code PM"]
+
+                # Décalage uniquement
+                comment = None
+                if diff is not None and diff > DECALAGE_MINUTES:
+                    comment = "Décalage"
+                rrow["Commentaire"] = comment
+            else:
+                rrow["Code PM"] = None
+                rrow["Commentaire"] = "Passage supplémentaire"
+
+            filled_rows.append(rrow)
+
+        # PM restants => Non diffusé (ligne insérée)
+        remaining = pm.loc[~pm.index.isin(used_pm)]
+        for _, prow in remaining.iterrows():
+            nd = {c: None for c in FINAL_COLUMNS}
+            nd["datep"] = real_day.iloc[0]["datep"] if len(real_day) else prow["Date"]
+            nd["supportp"] = real_day.iloc[0]["supportp"] if len(real_day) else prow["supportp"]
+            nd["Marque"] = real_day.iloc[0]["Marque"] if len(real_day) else prow["Marque"]
+            nd["Produit"] = real_day.iloc[0]["Produit"] if len(real_day) else None  # règle "jusqu’à Produit"
+            nd["Code PM"] = prow["Code PM"]
+            nd["Commentaire"] = "Non diffusé"
+            non_diffuse_rows.append(nd)
+
+        backlog = len(remaining)
+        return pd.DataFrame(filled_rows), pd.DataFrame(non_diffuse_rows), backlog
+
+    # CASE 3: plus de diffusions => assign d’abord pm chrono, puis extra = compensation ou passage sup
+    # Compensation: on applique un backlog de Non diffusé venant d’avant (géré plus haut au niveau timeline)
+    pm_list = list(pm.itertuples(index=False))
+    for i in range(n_real):
+        rrow = real.iloc[i].copy()
+        if i < n_pm:
+            # assign chrono
+            rrow["Code PM"] = pm.iloc[i]["Code PM"]
+            # Décalage?
+            treal = rrow["time_real"]
+            tpm = pm.iloc[i]["Heure_PM"]
+            comment = None
+            if treal is not None and tpm is not None:
+                diff = minutes_diff(treal, tpm)
+                if diff is not None and diff > DECALAGE_MINUTES:
+                    comment = "Décalage"
+            rrow["Commentaire"] = comment
+        else:
+            # extra
+            rrow["Code PM"] = None
+            # commentaire sera décidé plus tard avec backlog
+            rrow["Commentaire"] = "__EXTRA__"
+        filled_rows.append(rrow)
+
+    return pd.DataFrame(filled_rows), pd.DataFrame(non_diffuse_rows), 0
+
+def fill_codepm_commentaire_full(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date):
+    """
+    Applique toutes les règles:
+    - date <= max_date
+    - matching par Marque+Support+Date
+    - Non diffusé inséré
+    - Compensation/Passage supplémentaire
+    - Décalage >45
+    """
     df = df_final.copy()
     df["marque_norm"] = df["Marque"].apply(norm_txt)
     df["support_norm"] = df["supportp"].apply(norm_txt)
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
-    df["time_real"] = df["heure de diffusion"].apply(to_excel_time)
 
     if pmv_all is None or pmv_all.empty:
         return df[FINAL_COLUMNS]
 
-    out_rows = []
-    for (mn, sn, d), g in df.groupby(["marque_norm", "support_norm", "date_only"], dropna=False):
-        g = g.sort_values("time_real")
-        pm_day = pmv_all[(pmv_all["marque_norm"] == mn) & (pmv_all["support_norm"] == sn) & (pmv_all["date_only"] == d)].copy()
-        used = set()
+    pm = pmv_all.copy()
+    pm["marque_norm"] = pm["marque_norm"] if "marque_norm" in pm.columns else pm["Marque"].apply(norm_txt)
+    pm["support_norm"] = pm["support_norm"] if "support_norm" in pm.columns else pm["supportp"].apply(norm_txt)
+    pm["date_only"] = pm["date_only"] if "date_only" in pm.columns else pd.to_datetime(pm["Date"], errors="coerce").dt.date
 
-        for _, row in g.iterrows():
-            comment = ""
-            codepm = ""
+    out_all = []
 
-            if not pm_day.empty:
-                avail = pm_day.loc[~pm_day.index.isin(used)]
-                if not avail.empty:
-                    if row["time_real"] is None:
-                        pick = avail.iloc[0]
-                        diff = None
-                    else:
-                        tmp = avail.copy()
-                        tmp["diff"] = tmp["Heure_PM"].apply(lambda t: minutes_diff(row["time_real"], t) if t else 999999)
-                        pick = tmp.sort_values("diff").iloc[0]
-                        diff = pick["diff"]
+    # backlog de non diffusé par (marque_norm, support_norm)
+    backlog = {}
 
-                    used.add(pick.name)
-                    codepm = pick.get("Code PM", "")
+    # traiter groupe par marque+support sur toute la timeline (ordre date)
+    for (mn, sn), g_ms in df.groupby(["marque_norm", "support_norm"], dropna=False):
+        g_ms = g_ms.sort_values(["date_only", "heure de diffusion"], na_position="last").copy()
+        key = (mn, sn)
+        backlog.setdefault(key, 0)
 
-                    if diff is not None and diff > decalage_min:
-                        comment = "Décalage"
-                else:
-                    comment = "Passage supplémentaire"
-            else:
-                comment = "Passage supplémentaire"
+        dates = sorted([d for d in g_ms["date_only"].dropna().unique() if d <= max_date])
 
-            new_row = row.copy()
-            new_row["Code PM"] = codepm if codepm else None
-            new_row["Commentaire"] = comment if comment else None
-            out_rows.append(new_row)
+        for d in dates:
+            real_day = g_ms[g_ms["date_only"] == d].copy()
 
-    df_out = pd.DataFrame(out_rows)
-    return df_out[FINAL_COLUMNS]
+            pm_day = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn) & (pm["date_only"] == d)].copy()
+            pm_day = pm_day.sort_values("Heure_PM")
+
+            # tri réel (heure)
+            real_day["_treal"] = real_day["heure de diffusion"].apply(to_excel_time)
+            real_day = real_day.sort_values("_treal", na_position="last").drop(columns=["_treal"])
+
+            filled, non_diff, day_backlog = match_day(real_day, pm_day)
+
+            # gérer les lignes EXTRA (case n_real > n_pm) pour Compensation / Passage sup
+            if not filled.empty and "Commentaire" in filled.columns:
+                extra_mask = filled["Commentaire"].astype(str) == "__EXTRA__"
+                if extra_mask.any():
+                    # pour chaque extra: si backlog>0 => Compensation, sinon Passage supplémentaire
+                    for idx in filled[extra_mask].index:
+                        if backlog[key] > 0:
+                            filled.at[idx, "Commentaire"] = "Compensation"
+                            backlog[key] -= 1
+                        else:
+                            filled.at[idx, "Commentaire"] = "Passage supplémentaire"
+
+            # si on a créé des Non diffusé aujourd’hui => augmenter backlog
+            if day_backlog > 0:
+                backlog[key] += day_backlog
+
+            # output tri: ordre horaire (codes pm + diffusions)
+            # - les lignes “Non diffusé” n’ont pas d’heure réelle, on les place après par défaut
+            out_all.append(filled[FINAL_COLUMNS])
+            if not non_diff.empty:
+                out_all.append(non_diff[FINAL_COLUMNS])
+
+        # on ignore les dates futures de g_ms automatiquement
+
+    if not out_all:
+        return df[FINAL_COLUMNS]
+
+    out = pd.concat(out_all, ignore_index=True)
+
+    # tri global léger: Marque, support, date, heure
+    out["_d"] = pd.to_datetime(out["datep"], errors="coerce").dt.date
+    out["_t"] = out["heure de diffusion"].apply(to_excel_time)
+    out = out.sort_values(["Marque", "supportp", "_d", "_t"], na_position="last").drop(columns=["_d", "_t"])
+
+    return out[FINAL_COLUMNS]
 
 # =========================
-# Build output workbooks (FIX #1 + gridlines off + heure fiable)
+# Build workbooks (feuille par support, template, no gridlines)
 # =========================
 
 def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame) -> bytes:
     wb = template_wb
     template_ws = wb.worksheets[0]  # modèle
 
-    # ligne de style modèle
     style_row_cells = [template_ws.cell(DATA_START_ROW, c) for c in range(1, len(FINAL_COLUMNS) + 1)]
 
     def reset_sheet(ws):
-        # supprime données sous la ligne modèle
         if ws.max_row > DATA_START_ROW:
             ws.delete_rows(DATA_START_ROW + 1, ws.max_row - DATA_START_ROW)
-        # vider ligne modèle
         for c in range(1, len(FINAL_COLUMNS) + 1):
             ws.cell(DATA_START_ROW, c).value = None
-        # headers
         for c, col in enumerate(FINAL_COLUMNS, start=1):
             ws.cell(HEADER_ROW, c).value = col
-        # ✅ quadrillage OFF
         ws.sheet_view.showGridLines = False
 
     reset_sheet(template_ws)
@@ -394,7 +568,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
-        # ✅ écriture SAFE (pas de itertuples) => heure ne sera plus vide
+        # écriture SAFE (lecture par df)
         for i in range(len(sub)):
             r_idx = DATA_START_ROW + i
             if r_idx > DATA_START_ROW:
@@ -408,9 +582,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
                     dst.fill = pycopy(src.fill)
                     dst.border = pycopy(src.border)
                     dst.alignment = pycopy(src.alignment)
-                    dst.protection = pycopy(src.protection
-
-                    )
+                    dst.protection = pycopy(src.protection)
 
             for c, col in enumerate(FINAL_COLUMNS, start=1):
                 val = sub.iloc[i][col] if col in sub.columns else None
@@ -418,7 +590,6 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
 
-    # retirer feuille modèle
     wb.remove(template_ws)
 
     bio = io.BytesIO()
@@ -435,7 +606,7 @@ st.caption("Template chargé automatiquement depuis le repo : TEMPLATE_SUIVI_FIN
 tab1, tab2 = st.tabs(["Suivi Imperium", "Suivi Yumi (à brancher)"])
 
 with tab1:
-    st.subheader("Suivi Imperium — 2 Uploads (Data + PM)")
+    st.subheader("Suivi Imperium — Data + PM (remplissage Code PM + Commentaire)")
 
     # Template check
     template_ok = False
@@ -446,13 +617,16 @@ with tab1:
     except Exception as e:
         st.error(
             "Template introuvable ❌\n\n"
-            "➡️ Vérifie que le fichier s’appelle EXACTEMENT : TEMPLATE_SUIVI_FINAL.xlsx (sans double .xlsx)\n"
+            "➡️ Vérifie que le fichier s’appelle EXACTEMENT : TEMPLATE_SUIVI_FINAL.xlsx\n"
             f"Détail: {e}"
         )
 
     data_in = st.file_uploader("1) Uploader DATA IMPERIUM (filtré agence)", type=["xlsx"])
     pm_in = st.file_uploader("2) Uploader les PM validés (1 ou plusieurs)", type=["xlsx"], accept_multiple_files=True)
-    max_date = st.date_input("3) Date max (pas de futur)", value=date.today())
+
+    # Date max par défaut = N-1
+    default_max = date.today() - timedelta(days=1)
+    max_date = st.date_input("3) Date max (N-1 par défaut)", value=default_max)
 
     if st.button("Lancer la génération (Imperium)", use_container_width=True, disabled=(not template_ok)):
         if not data_in:
@@ -462,11 +636,10 @@ with tab1:
         else:
             try:
                 with st.spinner("Génération en cours..."):
-                    # Lire data
                     df_imp = pd.read_excel(data_in)
                     df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
 
-                    # Lire PMs
+                    # PMs -> PM vertical unifié
                     pms = []
                     for f in pm_in:
                         df_pm_raw = pd.read_excel(f, header=None)
@@ -475,10 +648,10 @@ with tab1:
                             pms.append(pmv)
                     pmv_all = pd.concat(pms, ignore_index=True) if pms else pd.DataFrame()
 
-                    # Remplir Code PM / Commentaire
-                    df_final = fill_codepm_commentaire(df_final, pmv_all, decalage_min=45)
+                    # ✅ MOTEUR FINAL (Code PM + Commentaire + Non diffusé + Compensation)
+                    df_final = fill_codepm_commentaire_full(df_final, pmv_all, max_date=max_date)
 
-                    # Générer 1 fichier par marque
+                    # 1 fichier par marque
                     client_files = {}
                     for marque in sorted(df_final["Marque"].dropna().unique()):
                         df_client = df_final[df_final["Marque"] == marque].copy()
@@ -490,12 +663,12 @@ with tab1:
 
                     st.session_state.client_files = client_files
                     st.session_state.zip_bytes = make_zip(client_files)
-                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
+                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés (Code PM + Commentaire remplis)"
 
             except Exception as e:
                 st.error(f"Erreur: {e}")
 
-    # ✅ Affichage persistant (ne disparaît plus après download)
+    # Résultats persistants
     if st.session_state.client_files:
         st.success(f"✅ {st.session_state.last_run_info}")
         st.download_button(
@@ -520,4 +693,4 @@ with tab1:
 
 with tab2:
     st.subheader("Suivi Yumi (à brancher)")
-    st.info("Dès que tu m’envoies un exemple DATA YUMI + son template final, je branche la même logique.")
+    st.info("Dès que tu m’envoies un exemple DATA YUMI + son PM + template final, je branche la même logique.")
