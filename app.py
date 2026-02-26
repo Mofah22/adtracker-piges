@@ -109,7 +109,7 @@ def to_excel_time(val):
     if val is None:
         return None
     try:
-        if pd.isna(val):  # attrape NaT/NaN
+        if pd.isna(val):
             return None
     except:
         pass
@@ -196,6 +196,15 @@ def make_zip(files: dict[str, bytes]) -> bytes:
         for name, data in files.items():
             z.writestr(name, data)
     return bio.getvalue()
+
+# ✅ AJOUT : find_column (manquant)
+def find_column(df: pd.DataFrame, candidates: list[str]):
+    cols = {c: norm_txt(c) for c in df.columns}
+    for c, cn in cols.items():
+        for cand in candidates:
+            if norm_txt(cand) in cn:
+                return c
+    return None
 
 # =========================
 # Template
@@ -292,7 +301,6 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
         if norm_txt(sup).startswith("TOTAL"):
             break
 
-        # forward fill chaine
         if sup is None or str(sup).strip() == "":
             sup = last_sup
         else:
@@ -312,11 +320,12 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
             if s in ("", "0", ".", "-", "OFF", "NAN", "NONE"):
                 continue
 
+            d = date_map[c]
             recs.append({
                 "PM_FILE_BRAND": pm_brand,
                 "PM_FILE_BRAND_N": normalize_brand(pm_brand),
-                "Date": date_map[c],
-                "date_only": pd.to_datetime(date_map[c], errors="coerce").date(),
+                "Date": d,
+                "date_only": pd.to_datetime(d, errors="coerce").date(),
                 "supportp": str(sup).strip(),
                 "support_norm": normalize_support(sup),
                 "Code PM": codepm_str,
@@ -350,7 +359,6 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out["Marque"] = df[col_mar].astype(str).str.strip()
     out["Marque_norm"] = out["Marque"].apply(normalize_brand)
 
-    # optionals
     out["Message"] = df[find_column(df_imp, ["message", "storyboard"])] if find_column(df_imp, ["message", "storyboard"]) else None
     out["Produit"] = df[find_column(df_imp, ["produit"])] if find_column(df_imp, ["produit"]) else None
     out["RaisonSociale"] = df[find_column(df_imp, ["raisonsociale", "raison sociale"])] if find_column(df_imp, ["raisonsociale", "raison sociale"]) else None
@@ -386,6 +394,14 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
 
     pm = pm_client.copy()
+    if pm.empty:
+        # pas de PM => on retourne juste template columns
+        base = df.copy()
+        for col in FINAL_COLUMNS:
+            if col not in base.columns:
+                base[col] = None
+        return base[FINAL_COLUMNS]
+
     pm = pm[pm["date_only"].notna()]
     pm = pm[pm["date_only"] <= max_date]
 
@@ -515,7 +531,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
             out_day = []
             if not df_filled.empty:
-                # forcer supportp affichage
                 df_filled["supportp"] = sup_display
                 out_day.append(df_filled)
             if not df_insert.empty:
@@ -523,19 +538,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
             out_day = pd.concat(out_day, ignore_index=True) if out_day else pd.DataFrame(columns=FINAL_COLUMNS)
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
-
-            # garder colonnes template
             out_all.append(out_day[FINAL_COLUMNS])
 
-    if not out_all:
-        # fallback sans PM
-        base = df_client.copy()
-        for col in FINAL_COLUMNS:
-            if col not in base.columns:
-                base[col] = None
-        return base[FINAL_COLUMNS]
-
-    return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS]
+    return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS] if out_all else df[FINAL_COLUMNS]
 
 # =========================
 # Build workbooks
@@ -639,10 +644,7 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
 
                     client_norm = normalize_brand(client_name)
 
-                    # PM strict match
                     pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
-
-                    # fallback contains
                     if pm_client.empty and not pmv_all.empty:
                         pm_client = pmv_all[
                             pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
