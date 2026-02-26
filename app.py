@@ -3,87 +3,51 @@ import pandas as pd
 import numpy as np
 import io
 import re
+import unicodedata
 from datetime import datetime, time, date
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
-DEBUG = True
+DEBUG = False  # True si tu veux voir les prints
 
 st.set_page_config(page_title="AdTracker Pro - Maroc", page_icon="🇲🇦", layout="wide")
 
 st.markdown("""
-    <style>
-    .main { background-color: #f8fafc; }
-    .stButton>button {
-        width: 100%;
-        border-radius: 8px;
-        height: 3.5em;
-        background-color: #7289DA;
-        color: white;
-        font-weight: bold;
-        border: none;
-        transition: all 0.3s;
-    }
-    .stButton>button:hover { background-color: #5b6eae; transform: translateY(-2px); }
-    .stDownloadButton>button {
-        width: 100%;
-        border-radius: 8px;
-        background-color: #43b581 !important;
-        color: white !important;
-    }
-    </style>
+<style>
+.main { background-color: #f8fafc; }
+.stButton>button {
+    width: 100%;
+    border-radius: 8px;
+    height: 3.5em;
+    background-color: #7289DA;
+    color: white;
+    font-weight: bold;
+    border: none;
+}
+.stDownloadButton>button {
+    width: 100%;
+    border-radius: 8px;
+    background-color: #43b581 !important;
+    color: white !important;
+}
+</style>
 """, unsafe_allow_html=True)
 
-# =========================================================
-# Helpers
-# =========================================================
+# =========================
+# Utils
+# =========================
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplatit MultiIndex et nettoie les noms de colonnes."""
-    df = df.copy()
+def norm_txt(x):
+    """Normalise texte: strip, uppercase, sans accents, espaces propres."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.upper()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    if isinstance(df.columns, pd.MultiIndex):
-        new_cols = []
-        for tup in df.columns:
-            parts = [str(x).strip() for x in tup if x is not None and str(x).strip().lower() != "nan"]
-            new_cols.append(" ".join(parts).strip() if parts else "")
-        df.columns = new_cols
-    else:
-        df.columns = [str(c).strip() for c in df.columns]
-
-    df.columns = [re.sub(r"^Unnamed:.*$", "", c).strip() for c in df.columns]
-    df.columns = [c if c else f"COL_{i}" for i, c in enumerate(df.columns)]
-    return df
-
-def make_unique_columns(cols):
-    """
-    Rend les colonnes uniques.
-    Si une colonne est dupliquée, ajoute __2, __3...
-    """
-    seen = {}
-    out = []
-    for c in cols:
-        base = str(c).strip()
-        if base in seen:
-            seen[base] += 1
-            out.append(f"{base}__{seen[base]}")
-        else:
-            seen[base] = 1
-            out.append(base)
-    return out
-
-def strip_dup_suffix(x: str) -> str:
-    """Enlève suffixe __2/__3..."""
-    return re.sub(r"__\d+$", "", str(x))
-
-def get_series(df: pd.DataFrame, col: str):
-    if col not in df.columns:
-        return None
-    x = df[col]
-    if isinstance(x, pd.DataFrame):
-        return x.iloc[:, 0]
-    return x
-
-def parse_time(t):
+def parse_time_any(t):
     if pd.isna(t) or str(t).strip() == "":
         return None
     if isinstance(t, time):
@@ -94,7 +58,6 @@ def parse_time(t):
         seconds = int(round(float(t) * 86400))
         seconds = max(0, min(seconds, 86399))
         return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
-
     t_str = str(t).strip().replace(" ", "").replace("h", ":").replace("H", ":")
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
@@ -103,123 +66,156 @@ def parse_time(t):
             continue
     return None
 
-def is_date_val(val):
-    if isinstance(val, (datetime, date, pd.Timestamp)):
+def is_date_like(v):
+    if isinstance(v, (datetime, date, pd.Timestamp)):
         return True
-    s = str(val).strip()
-    return bool(re.search(r'\d{1,2}[/-]\d{1,2}|\d{4}-\d{2}-\d{2}', s))
+    s = str(v).strip()
+    return bool(re.search(r"\d{4}-\d{2}-\d{2}", s)) or bool(re.search(r"\d{1,2}[/-]\d{1,2}", s))
 
-def debug_cols(title: str, df: pd.DataFrame):
-    if not DEBUG:
-        return
-    st.write(f"### {title}")
-    st.write("Colonnes:", list(df.columns))
-    dups = pd.Index(df.columns)[pd.Index(df.columns).duplicated()].tolist()
-    st.write("Doublons:", dups)
-    st.write("dtypes:", df.dtypes.astype(str))
-
-# =========================================================
-# Standardisation PM
-# =========================================================
-
-def standardize_pm_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-
-    def find_col(keys):
-        for c in df.columns:
-            cl = str(c).lower().strip()
-            if any(k in cl for k in keys):
-                return c
-        return None
-
-    col_date   = find_col(['date', 'jour'])
-    col_heure  = find_col(['heure', 'horaire', 'time'])
-    col_marque = find_col(['marque', 'annonceur', 'client'])
-    col_sup    = find_col(['support', 'chaîne', 'chaine', 'station'])
-    col_code   = find_col(['code', 'ecran', 'écran'])
-
-    rename = {}
-    if col_date:   rename[col_date] = 'Date'
-    if col_heure:  rename[col_heure] = 'Heure'
-    if col_marque: rename[col_marque] = 'Marque'
-    if col_sup:    rename[col_sup] = 'Support'
-    if col_code:   rename[col_code] = 'Code_Ecran'
-
-    df2 = df.rename(columns=rename).copy()
-    df2 = df2.loc[:, ~pd.Index(df2.columns).duplicated()].copy()
-
-    s_date = get_series(df2, 'Date')
-    if s_date is not None:
-        df2['Date'] = pd.to_datetime(s_date, errors='coerce')
-
-    s_heure = get_series(df2, 'Heure')
-    if s_heure is not None:
-        df2['Heure'] = s_heure.apply(parse_time)
-
-    return df2
-
-def transform_pm_horizontal(df: pd.DataFrame) -> pd.DataFrame:
+def extract_marque_from_filename(fname: str) -> str:
     """
-    Detect PM horizontal (dates en colonnes) -> melt.
-    FIX important : rendre colonnes uniques avant melt pour éviter bug dtype.
+    Ex: 'PM LE BERGER RAMADAN 2026 TV - V4.xlsx' -> 'LE BERGER'
+        'PM GATO RAMADAN 2026 2M TV - VF 3.xlsx' -> 'GATO'
     """
-    df = normalize_columns(df)
+    base = fname.rsplit(".", 1)[0]
+    base = base.replace("_", " ")
+    base = re.sub(r"\s+", " ", base).strip()
 
-    header_idx = -1
-    for i in range(min(len(df), 25)):
-        row = df.iloc[i]
-        if sum(1 for x in row if is_date_val(x)) >= 2:
-            header_idx = i
+    # enlever "PM"
+    base = re.sub(r"^PM\s+", "", base, flags=re.IGNORECASE)
+
+    # couper sur RAMADAN si présent
+    parts = re.split(r"\bRAMADAN\b", base, flags=re.IGNORECASE)
+    marque = parts[0].strip() if parts else base.strip()
+
+    # nettoyer
+    marque = re.sub(r"\s+", " ", marque).strip()
+    return marque
+
+# =========================
+# PM parser (template grille)
+# =========================
+
+def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
+    """
+    Transforme ton PM 'grille' en table verticale:
+    Date | Support | Marque | Code_Ecran | Duree_PM (optionnel)
+    """
+    # df_raw est lu avec header=None
+    df = df_raw.copy()
+
+    # 1) Trouver la ligne qui contient les headers méta (avec "Période", "Chaine", "Ecran"...)
+    meta_header_row = None
+    for i in range(min(len(df), 30)):
+        row = df.iloc[i].astype(str).str.lower()
+        if row.str.contains("periode").any() and row.str.contains("chaine").any() and row.str.contains("ecran").any():
+            meta_header_row = i
             break
 
-    # PM déjà vertical
-    if header_idx == -1:
-        return standardize_pm_columns(df)
+    if meta_header_row is None:
+        raise ValueError("PM: impossible de trouver la ligne d’en-têtes (Période / Chaine / Ecran...).")
 
-    # Recréer les colonnes depuis la ligne calendrier
-    raw_cols = []
-    for x in df.iloc[header_idx].tolist():
-        if isinstance(x, (datetime, date, pd.Timestamp)):
-            raw_cols.append(pd.to_datetime(x).strftime("%Y-%m-%d"))
+    # 2) Trouver la ligne des dates (beaucoup de datetime)
+    date_header_row = None
+    for i in range(meta_header_row, min(len(df), meta_header_row + 15)):
+        cnt_dates = sum(isinstance(x, (datetime, date, pd.Timestamp)) for x in df.iloc[i].tolist())
+        if cnt_dates >= 2:
+            date_header_row = i
+            break
+
+    if date_header_row is None:
+        # fallback: chercher des strings date
+        for i in range(meta_header_row, min(len(df), meta_header_row + 20)):
+            row_vals = df.iloc[i].tolist()
+            cnt = sum(is_date_like(x) for x in row_vals)
+            if cnt >= 2:
+                date_header_row = i
+                break
+
+    if date_header_row is None:
+        raise ValueError("PM: impossible de trouver la ligne des dates.")
+
+    # 3) Construire noms de colonnes à partir de la meta header row
+    meta_cols_names = df.iloc[meta_header_row].tolist()
+
+    # 4) Identifier quelles colonnes sont des dates à partir de date_header_row
+    date_headers = df.iloc[date_header_row].tolist()
+    date_cols_idx = []
+    date_map = {}  # idx -> datetime
+    for j, v in enumerate(date_headers):
+        if isinstance(v, (datetime, date, pd.Timestamp)):
+            d = pd.to_datetime(v).date()
+            date_cols_idx.append(j)
+            date_map[j] = pd.to_datetime(d)
+
         else:
-            raw_cols.append(str(x).strip())
+            # string date possible
+            if is_date_like(v):
+                d = pd.to_datetime(v, errors="coerce")
+                if pd.notna(d):
+                    date_cols_idx.append(j)
+                    date_map[j] = pd.to_datetime(d.date())
 
-    # Colonnes uniques (clé du fix)
-    df.columns = make_unique_columns([c if c else "COL" for c in raw_cols])
+    # On garde seulement les vraies colonnes dates (très important)
+    if len(date_cols_idx) < 2:
+        raise ValueError("PM: je n’ai pas identifié assez de colonnes dates.")
 
-    # Données sous le header
-    df = df.iloc[header_idx + 1:].reset_index(drop=True)
+    # 5) Data rows commencent après la ligne des dates
+    data_start = date_header_row + 1
+    data = df.iloc[data_start:].copy()
+    data = data.dropna(how="all")
 
-    # Nettoyage basique
-    df = df.dropna(how="all")
-    df = df.copy()
+    # 6) Trouver indices des champs clé dans la meta header row
+    def find_idx(needle):
+        for j, v in enumerate(meta_cols_names):
+            if norm_txt(v).find(norm_txt(needle)) >= 0:
+                return j
+        return None
 
-    # Séparer meta vs dates (dates sont souvent des strings "YYYY-MM-DD" ou "dd/mm")
-    meta_cols = [c for c in df.columns if not is_date_val(strip_dup_suffix(c))]
-    date_cols = [c for c in df.columns if is_date_val(strip_dup_suffix(c))]
+    idx_chaine = find_idx("Chaine")
+    idx_ecran = find_idx("Ecran")
 
-    # ⭐ Fix final : melt sur colonnes uniques
-    df_vert = df.melt(
-        id_vars=meta_cols,
-        value_vars=date_cols,
-        var_name="Date",
-        value_name="Code_Ecran"
-    )
+    if idx_chaine is None or idx_ecran is None:
+        raise ValueError("PM: colonnes 'Chaine' ou 'Ecran' introuvables dans la ligne en-tête.")
 
-    # Retirer suffixe des dates puis convertir
-    df_vert["Date"] = df_vert["Date"].apply(strip_dup_suffix)
-    df_vert["Date"] = pd.to_datetime(df_vert["Date"], errors="coerce")
+    marque = extract_marque_from_filename(pm_filename)
 
-    # Nettoyage spots vides
-    df_vert = df_vert.dropna(subset=["Code_Ecran"])
-    df_vert = df_vert[~df_vert["Code_Ecran"].astype(str).str.strip().isin(["0", "", "nan", "None"])]
+    records = []
+    for _, r in data.iterrows():
+        support_val = r.iloc[idx_chaine]
+        code_ecran = r.iloc[idx_ecran]
 
-    # Standardisation finale
-    return standardize_pm_columns(df_vert)
+        # si pas d’écran -> on skip
+        if pd.isna(code_ecran) or str(code_ecran).strip() == "":
+            continue
 
-# =========================================================
-# Excel template
-# =========================================================
+        for j in date_cols_idx:
+            cell = r.iloc[j]
+            if pd.isna(cell) or str(cell).strip() == "":
+                continue  # pas de spot ce jour-là
+
+            records.append({
+                "Date": date_map[j],
+                "Support": support_val,
+                "Marque": marque,
+                "Code_Ecran": str(code_ecran).strip(),
+                "Duree_PM": str(cell).strip()
+            })
+
+    pmv = pd.DataFrame(records)
+    if pmv.empty:
+        return pmv
+
+    # Normalisation matching
+    pmv["Support_norm"] = pmv["Support"].apply(norm_txt)
+    pmv["Marque_norm"] = pmv["Marque"].apply(norm_txt)
+    pmv["Code_Ecran"] = pmv["Code_Ecran"].astype(str).str.strip()
+
+    return pmv
+
+# =========================
+# Output Excel (style)
+# =========================
 
 def apply_template(writer, sheet_name, df):
     ws = writer.sheets[sheet_name]
@@ -255,169 +251,168 @@ def apply_template(writer, sheet_name, df):
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 22
 
-# =========================================================
-# Reconciliation
-# =========================================================
+# =========================
+# Reconcile
+# =========================
 
-def reconcile_all(df_brute, df_pm_total):
-    df_brute = normalize_columns(df_brute)
-    df_pm_total = standardize_pm_columns(df_pm_total)
+def reconcile_all(df_brute, pmv):
+    """
+    df_brute: ton fichier DATA BRUT (réalisé)
+    pmv: PM vertical (Date, Support, Marque, Code_Ecran)
+    """
+    # Detect columns in brute
+    cols = {c: norm_txt(c) for c in df_brute.columns}
 
-    def find_col(df, keys):
-        for c in df.columns:
-            cl = str(c).lower().strip()
+    def find_col(keys):
+        keys = [norm_txt(k) for k in keys]
+        for c, cl in cols.items():
             if any(k in cl for k in keys):
                 return c
         return None
 
-    br_map = {
-        'Date': find_col(df_brute, ['date', 'jour']),
-        'Heure': find_col(df_brute, ['heure', 'time', 'horaire']),
-        'Marque': find_col(df_brute, ['marque', 'client', 'annonceur']),
-        'Support': find_col(df_brute, ['support', 'chaîne', 'chaine', 'station']),
-        'Code': find_col(df_brute, ['code', 'ecran', 'écran'])
-    }
-    for k, v in br_map.items():
-        if v is None:
-            raise ValueError(f"La colonne '{k}' est introuvable dans la Data Brute.")
+    col_date = find_col(["date", "jour"])
+    col_sup  = find_col(["chaine", "support", "station"])
+    col_time = find_col(["h.debut", "heure", "horaire", "time"])
+    col_mar  = find_col(["marque", "annonceur", "client"])
+    col_code = find_col(["code ecran", "ecran", "code"])
 
-    df_b = df_brute.rename(columns={v: k for k, v in br_map.items() if v}).copy()
-    df_b = df_b.loc[:, ~pd.Index(df_b.columns).duplicated()].copy()
+    for name, col in [("Date", col_date), ("Support", col_sup), ("Marque", col_mar), ("Code", col_code)]:
+        if col is None:
+            raise ValueError(f"DATA BRUT: colonne '{name}' introuvable.")
 
-    s_date = get_series(df_b, 'Date')
-    df_b['Date'] = pd.to_datetime(s_date, errors='coerce') if s_date is not None else pd.NaT
-    s_heure = get_series(df_b, 'Heure')
-    df_b['Heure'] = s_heure.apply(parse_time) if s_heure is not None else None
+    df_b = df_brute.copy()
+    df_b["Date"] = pd.to_datetime(df_b[col_date], errors="coerce")
+    df_b["Support"] = df_b[col_sup]
+    df_b["Marque"] = df_b[col_mar]
+    df_b["Code"] = df_b[col_code]
+    df_b["Heure"] = df_b[col_time].apply(parse_time_any) if col_time else None
+
+    df_b["Support_norm"] = df_b["Support"].apply(norm_txt)
+    df_b["Marque_norm"] = df_b["Marque"].apply(norm_txt)
 
     output_files = {}
-    marques = df_b['Marque'].dropna().unique()
+    for marque in sorted(df_b["Marque_norm"].dropna().unique()):
+        b_m = df_b[df_b["Marque_norm"] == marque]
+        p_m = pmv[pmv["Marque_norm"] == marque]
 
-    for m in marques:
-        b_m = df_b[df_b['Marque'] == m]
-        p_m = df_pm_total[df_pm_total['Marque'] == m] if 'Marque' in df_pm_total.columns else pd.DataFrame()
         if p_m.empty:
             continue
 
         client_results = []
-        supports = b_m['Support'].dropna().unique()
+        for sup in sorted(b_m["Support_norm"].dropna().unique()):
+            s_b = b_m[b_m["Support_norm"] == sup].sort_values(["Date", "Heure"])
+            s_p = p_m[p_m["Support_norm"] == sup].sort_values(["Date"])  # pas d'heure dans PM
 
-        for s in supports:
-            s_b = b_m[b_m['Support'] == s].sort_values(['Date', 'Heure'])
-            s_p = p_m[p_m['Support'] == s].sort_values(['Date', 'Heure'])
+            if s_p.empty:
+                continue
 
-            dates = sorted(list(
-                set(s_b['Date'].dt.date.dropna().unique()) |
-                set(s_p['Date'].dt.date.dropna().unique())
-            ))
+            all_dates = sorted(set(s_b["Date"].dt.date.dropna().unique()) | set(s_p["Date"].dt.date.dropna().unique()))
+            for d in all_dates:
+                day_b = s_b[s_b["Date"].dt.date == d]
+                day_p = s_p[s_p["Date"].dt.date == d]
 
-            for d in dates:
-                day_b = s_b[s_b['Date'].dt.date == d]
-                day_p = s_p[s_p['Date'].dt.date == d]
-                used_p_idx = []
+                used = set()
 
+                # Match chronologique: on affecte le 1er écran PM dispo
                 for _, r in day_b.iterrows():
-                    avail = day_p[~day_p.index.isin(used_p_idx)]
+                    avail = day_p.loc[~day_p.index.isin(used)]
                     row_data = r.to_dict()
 
                     if not avail.empty:
                         p_match = avail.iloc[0]
-                        used_p_idx.append(avail.index[0])
-                        row_data['Code Ecran PM'] = p_match.get('Code_Ecran', '')
-
-                        tr, tp = parse_time(r.get('Heure')), parse_time(p_match.get('Heure'))
-                        if tr and tp:
-                            dummy = datetime.today()
-                            diff = abs((datetime.combine(dummy, tr) - datetime.combine(dummy, tp)).total_seconds() / 60)
-                            row_data['Commentaire'] = "Décalage" if diff > 45 else ""
-                        else:
-                            row_data['Commentaire'] = ""
+                        used.add(p_match.name)
+                        row_data["Code Ecran PM"] = p_match.get("Code_Ecran", "")
+                        row_data["Commentaire"] = ""
                     else:
-                        row_data['Code Ecran PM'] = ""
-                        row_data['Commentaire'] = "Passage supplémentaire"
+                        row_data["Code Ecran PM"] = ""
+                        row_data["Commentaire"] = "Passage supplémentaire"
 
                     client_results.append(row_data)
 
-                remaining = day_p[~day_p.index.isin(used_p_idx)]
+                # Non diffusés
+                remaining = day_p.loc[~day_p.index.isin(used)]
                 for _, p in remaining.iterrows():
-                    nd_row = {
-                        'Date': d,
-                        'Support': s,
-                        'Marque': m,
-                        'Code Ecran PM': p.get('Code_Ecran', ''),
-                        'Commentaire': 'Non diffusé'
+                    nd = {
+                        "Date": p["Date"],
+                        "Support": p["Support"],
+                        "Marque": p["Marque"],
+                        "Code Ecran PM": p.get("Code_Ecran", ""),
+                        "Commentaire": "Non diffusé"
                     }
-                    for col in df_b.columns:
-                        if col not in nd_row:
-                            nd_row[col] = ""
-                    client_results.append(nd_row)
+                    client_results.append(nd)
 
         if client_results:
-            df_final_client = pd.DataFrame(client_results)
+            df_final = pd.DataFrame(client_results)
+
+            # nom marque original (première valeur)
+            marque_name = b_m["Marque"].dropna().iloc[0] if not b_m["Marque"].dropna().empty else marque
+
             bio = io.BytesIO()
-            with pd.ExcelWriter(bio, engine='openpyxl') as writer:
-                for sup in df_final_client['Support'].dropna().unique():
-                    dfs = df_final_client[df_final_client['Support'] == sup].copy()
-                    sheet = str(sup)[:30] if str(sup).strip() else "Support"
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                for sup_val in df_final["Support"].dropna().unique():
+                    dfs = df_final[df_final["Support"] == sup_val].copy()
+                    sheet = str(sup_val)[:30] if str(sup_val).strip() else "Support"
                     dfs.to_excel(writer, index=False, sheet_name=sheet, startrow=8)
                     apply_template(writer, sheet, dfs)
-            output_files[m] = bio.getvalue()
+
+            output_files[marque_name] = bio.getvalue()
 
     return output_files
 
-# =========================================================
+# =========================
 # UI
-# =========================================================
+# =========================
 
 st.title("🇲🇦 AdTracker Pro : Media Reconciler")
 st.markdown("### Automatisation des rapports de suivi clients")
 
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    pm_in = st.file_uploader("📁 Uploader les fichiers PM (Grilles ou listes)", accept_multiple_files=True)
+    pm_files = st.file_uploader("📁 Uploader les fichiers PM (Grilles)", accept_multiple_files=True)
 with col_up2:
     brute_in = st.file_uploader("📊 Uploader la Data Brute (Pige cabinet)")
 
 if st.button("LANCER LE TRAITEMENT", use_container_width=True):
-    if pm_in and brute_in:
+    if pm_files and brute_in:
         try:
             with st.spinner("Analyse et réconciliation en cours..."):
+                df_brute = pd.read_excel(brute_in, header=0)
 
-                df_brute_raw = pd.read_excel(brute_in, header=0)
-                df_brute_raw = normalize_columns(df_brute_raw)
-                debug_cols("DATA BRUTE", df_brute_raw)
+                # PM: concat vertical
+                pms = []
+                for f in pm_files:
+                    df_raw = pd.read_excel(f, header=None)  # ⭐ important
+                    pmv = pm_grid_to_vertical(df_raw, getattr(f, "name", "PM.xlsx"))
+                    if DEBUG:
+                        st.write(f"PM '{getattr(f,'name','PM')}' -> lignes:", len(pmv))
+                        st.write(pmv.head(5))
+                    if not pmv.empty:
+                        pms.append(pmv)
 
-                pms_vertical = []
-                for f in pm_in:
-                    df_pm_raw = pd.read_excel(f, header=0)
-                    df_pm_raw = normalize_columns(df_pm_raw)
-                    debug_cols(f"PM RAW ({getattr(f, 'name', 'PM')})", df_pm_raw)
-
-                    pmv = transform_pm_horizontal(df_pm_raw)
-                    debug_cols(f"PM VERTICAL ({getattr(f, 'name', 'PM')})", pmv)
-                    pms_vertical.append(pmv)
-
-                df_pm_unified = pd.concat(pms_vertical, ignore_index=True)
-                df_pm_unified = standardize_pm_columns(df_pm_unified)
-                debug_cols("PM UNIFIÉ", df_pm_unified)
-
-                final_outputs = reconcile_all(df_brute_raw, df_pm_unified)
-
-                if final_outputs:
-                    st.success(f"✅ {len(final_outputs)} clients traités avec succès.")
-                    st.divider()
-                    grid = st.columns(3)
-                    for i, (client_name, data) in enumerate(final_outputs.items()):
-                        with grid[i % 3]:
-                            st.download_button(
-                                label=f"📥 Suivi : {client_name}",
-                                data=data,
-                                file_name=f"Suivi_{client_name}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
+                if not pms:
+                    st.warning("Aucun spot PM détecté dans les grilles. Vérifie le template PM.")
                 else:
-                    st.warning("Aucune correspondance trouvée. Vérifiez que les noms des marques et supports sont identiques dans vos fichiers.")
+                    pmv_all = pd.concat(pms, ignore_index=True)
+
+                    final_outputs = reconcile_all(df_brute, pmv_all)
+
+                    if final_outputs:
+                        st.success(f"✅ {len(final_outputs)} clients traités avec succès.")
+                        st.divider()
+
+                        grid = st.columns(3)
+                        for i, (client_name, data) in enumerate(final_outputs.items()):
+                            with grid[i % 3]:
+                                st.download_button(
+                                    label=f"📥 Suivi : {client_name}",
+                                    data=data,
+                                    file_name=f"Suivi_{client_name}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                    else:
+                        st.warning("Aucune correspondance trouvée. Vérifie surtout les noms Marque/Support entre PM (nom fichier + chaine) et Data Brute.")
         except Exception as e:
-            st.error(f"Une erreur est survenue lors du traitement : {e}")
+            st.error(f"Erreur: {e}")
             if DEBUG:
                 import traceback
                 st.code(traceback.format_exc())
@@ -425,4 +420,4 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         st.warning("Veuillez charger les fichiers nécessaires.")
 
 st.divider()
-st.caption("AdTracker Pro v3.0 - Outil interne d'agence média | Marché Maroc.")
+st.caption("AdTracker Pro - Version PM Grille (Marque depuis nom fichier)")
