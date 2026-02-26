@@ -349,16 +349,21 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     return out[FINAL_COLUMNS]
 
 # =========================
-# Matching Claude + insert rows A,B,D,E
+# Insert minimal rows
 # =========================
 
 def insert_minimal_row(d: date, sup: str, codepm: str, comment: str):
+    # Remplir seulement A(datep) B(supportp) D(Code PM) E(Commentaire)
     row = {c: None for c in FINAL_COLUMNS}
     row["datep"] = d
     row["supportp"] = sup
     row["Code PM"] = codepm
     row["Commentaire"] = comment
     return row
+
+# =========================
+# Matching Claude + union dates (FIX "non diffusé le lendemain")
+# =========================
 
 def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date):
     df = df_final.copy()
@@ -372,7 +377,7 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
         return df[FINAL_COLUMNS]
 
     out_all = []
-    backlog = {}
+    backlog = {}  # (marque,support) -> non diffusés non compensés
 
     for (mn, sn), g_ms in df.groupby(["marque_norm", "support_norm"], dropna=False):
         key = (mn, sn)
@@ -380,14 +385,30 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
 
         g_ms = g_ms[g_ms["date_only"].notna()].copy()
         g_ms = g_ms[g_ms["date_only"] <= max_date]
-        if g_ms.empty:
-            continue
 
-        for d in sorted(g_ms["date_only"].unique()):
+        pm_ms = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn)].copy()
+        pm_ms = pm_ms[pm_ms["date_only"].notna()]
+        pm_ms = pm_ms[pm_ms["date_only"] <= max_date]
+
+        # ✅ union dates
+        dates_real = set(g_ms["date_only"].unique()) if not g_ms.empty else set()
+        dates_pm = set(pm_ms["date_only"].unique()) if not pm_ms.empty else set()
+        all_dates = sorted(list(dates_real | dates_pm))
+
+        def pick_closest(avail, t):
+            if avail.empty:
+                return None, None
+            if t is None:
+                pick = avail.iloc[0]
+                return pick, None
+            tmp = avail.copy()
+            tmp["diff"] = tmp["Heure_PM"].apply(lambda x: minutes_diff(t, x) if x else 999999)
+            pick = tmp.sort_values("diff").iloc[0]
+            return pick, float(pick["diff"])
+
+        for d in all_dates:
             real_day = g_ms[g_ms["date_only"] == d].copy().sort_values("t_real", na_position="last")
-
-            pm_day = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn) & (pm["date_only"] == d)].copy()
-            pm_day = pm_day.sort_values("Heure_PM", na_position="last")
+            pm_day = pm_ms[pm_ms["date_only"] == d].copy().sort_values("Heure_PM", na_position="last")
 
             real_n = len(real_day)
             pm_n = len(pm_day)
@@ -396,19 +417,14 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             filled_rows = []
             inserted_rows = []
 
-            def pick_closest(avail, t):
-                if avail.empty:
-                    return None, None
-                if t is None:
-                    pick = avail.iloc[0]
-                    return pick, None
-                tmp = avail.copy()
-                tmp["diff"] = tmp["Heure_PM"].apply(lambda x: minutes_diff(t, x) if x else 999999)
-                pick = tmp.sort_values("diff").iloc[0]
-                return pick, float(pick["diff"])
+            # ✅ si aucun réalisé et PM existe => tout Non diffusé à la bonne date
+            if real_n == 0 and pm_n > 0:
+                for _, p in pm_day.iterrows():
+                    inserted_rows.append(insert_minimal_row(d, p["supportp"], p["Code PM"], "Non diffusé"))
+                backlog[key] += pm_n
 
-            # equal => chrono
-            if real_n == pm_n:
+            # égal => chrono
+            elif real_n == pm_n:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
                     p = pm_day.iloc[i]
@@ -442,10 +458,10 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
 
                 remaining = pm_day.loc[~pm_day.index.isin(used)]
                 for _, p in remaining.iterrows():
-                    inserted_rows.append(insert_minimal_row(d, real_day.iloc[0]["supportp"], p["Code PM"], "Non diffusé"))
+                    inserted_rows.append(insert_minimal_row(d, p["supportp"], p["Code PM"], "Non diffusé"))
                 backlog[key] += len(remaining)
 
-            # real > pm => chrono + extras
+            # real > pm => chrono puis extras
             else:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -469,7 +485,7 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame(columns=df.columns)
             df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS)
 
-            # sort by heure réelle, sinon heure PM (code)
+            # tri par heure (réel sinon PM)
             def sort_time(row):
                 t = to_excel_time(row.get("heure de diffusion"))
                 if t is not None:
