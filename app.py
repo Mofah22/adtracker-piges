@@ -15,6 +15,7 @@ from copy import copy as pycopy
 TEMPLATE_PATH = "TEMPLATE_SUIVI_FINAL.xlsx"
 HEADER_ROW = 9
 DATA_START_ROW = 10
+DECALAGE_MINUTES = 45
 
 FINAL_COLUMNS = [
     "datep",
@@ -32,8 +33,6 @@ FINAL_COLUMNS = [
     "rangE",
     "encombE",
 ]
-
-DECALAGE_MINUTES = 45
 
 st.set_page_config(page_title="Suivi Pige — Automatisation", page_icon="📊", layout="wide")
 
@@ -97,6 +96,7 @@ def to_excel_time(val):
     if isinstance(val, pd.Timestamp):
         return val.to_pydatetime().time()
 
+    # numpy datetime64
     try:
         import numpy as np
         if isinstance(val, np.datetime64):
@@ -106,6 +106,7 @@ def to_excel_time(val):
     except:
         pass
 
+    # Excel float time
     if isinstance(val, (float, int)):
         seconds = int(round(float(val) * 86400))
         seconds = max(0, min(seconds, 86399))
@@ -161,14 +162,8 @@ def load_template_workbook() -> openpyxl.Workbook:
     return openpyxl.load_workbook(TEMPLATE_PATH)
 
 # =========================
-# PM parsing (grilles) — FIX CHAINES VIDES
+# PM parsing (OpenPyXL merge-aware)
 # =========================
-
-def is_date_like(v):
-    if isinstance(v, (datetime, date, pd.Timestamp)):
-        return True
-    s = str(v).strip()
-    return bool(re.search(r"\d{4}-\d{2}-\d{2}", s)) or bool(re.search(r"\d{1,2}[/-]\d{1,2}", s))
 
 def extract_marque_from_filename(fname: str) -> str:
     base = fname.rsplit(".", 1)[0]
@@ -179,111 +174,127 @@ def extract_marque_from_filename(fname: str) -> str:
     marque = parts[0].strip() if parts else base.strip()
     return re.sub(r"\s+", " ", marque).strip()
 
-def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
-    """
-    ✅ FIX: forward-fill Chaine sur les lignes vides.
-    Ignore aussi OFF / '.' etc.
-    """
-    df = df_raw.copy()
+def is_date_like_any(v):
+    if isinstance(v, (datetime, date, pd.Timestamp)):
+        return True
+    s = str(v).strip()
+    return bool(re.search(r"\d{4}-\d{2}-\d{2}", s)) or bool(re.search(r"\d{1,2}[/-]\d{1,2}", s))
 
-    def row_has(i, keywords):
-        row = df.iloc[i].tolist()
-        row_norm = [norm_txt(x) for x in row]
-        return any(any(k in cell for k in keywords) for cell in row_norm)
+def merged_value(ws, r, c):
+    """Retourne la valeur de la cellule; si None et cellule dans merged range => valeur top-left."""
+    val = ws.cell(r, c).value
+    if val is not None and str(val).strip() != "":
+        return val
+    for rng in ws.merged_cells.ranges:
+        if (rng.min_row <= r <= rng.max_row) and (rng.min_col <= c <= rng.max_col):
+            return ws.cell(rng.min_row, rng.min_col).value
+    return val
 
-    meta_header_row = None
-    for i in range(min(len(df), 80)):
-        if row_has(i, ["CHAINE"]) and row_has(i, ["ECRAN"]) and row_has(i, ["TRANCHE", "HORAIRE", "PROGRAMME", "AVANT", "APRES", "APRÈS"]):
-            meta_header_row = i
+def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    # trouver meta header row
+    meta_row = None
+    for r in range(1, min(ws.max_row, 90) + 1):
+        row_vals = [norm_txt(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 60) + 1)]
+        if any("CHAINE" in v for v in row_vals) and any("ECRAN" in v for v in row_vals) and (
+            any("TRANCHE" in v for v in row_vals) or any("HORAIRE" in v for v in row_vals) or any("PROGRAMME" in v for v in row_vals)
+        ):
+            meta_row = r
             break
-    if meta_header_row is None:
-        raise ValueError(f"PM ({pm_filename}): ligne d’en-têtes introuvable.")
+    if meta_row is None:
+        raise ValueError(f"PM ({filename}): ligne d’en-têtes introuvable.")
 
-    date_header_row = None
-    for i in range(meta_header_row, min(len(df), meta_header_row + 40)):
-        row_vals = df.iloc[i].tolist()
-        if sum(is_date_like(x) for x in row_vals) >= 2:
-            date_header_row = i
+    # trouver date row (beaucoup de dates)
+    date_row = None
+    for r in range(meta_row, min(ws.max_row, meta_row + 50) + 1):
+        cnt = 0
+        for c in range(1, min(ws.max_column, 80) + 1):
+            v = ws.cell(r, c).value
+            if is_date_like_any(v):
+                cnt += 1
+        if cnt >= 2:
+            date_row = r
             break
-    if date_header_row is None:
-        raise ValueError(f"PM ({pm_filename}): ligne des dates introuvable.")
+    if date_row is None:
+        raise ValueError(f"PM ({filename}): ligne des dates introuvable.")
 
-    meta_cols = df.iloc[meta_header_row].tolist()
-    date_headers = df.iloc[date_header_row].tolist()
+    # indices colonnes Chaine / Ecran
+    chaine_col = None
+    ecran_col = None
+    for c in range(1, min(ws.max_column, 60) + 1):
+        v = norm_txt(ws.cell(meta_row, c).value)
+        if "CHAINE" in v and chaine_col is None:
+            chaine_col = c
+        if "ECRAN" in v and ecran_col is None:
+            ecran_col = c
+    if chaine_col is None or ecran_col is None:
+        raise ValueError(f"PM ({filename}): colonnes Chaine/Ecran introuvables.")
 
-    date_cols_idx, date_map = [], {}
-    for j, v in enumerate(date_headers):
-        d = pd.to_datetime(v, errors="coerce") if is_date_like(v) else pd.NaT
-        if pd.notna(d):
-            date_cols_idx.append(j)
-            date_map[j] = pd.to_datetime(d.date())
+    # colonnes de dates
+    date_cols = []
+    date_map = {}
+    for c in range(1, min(ws.max_column, 200) + 1):
+        v = ws.cell(date_row, c).value
+        if is_date_like_any(v):
+            d = pd.to_datetime(v, errors="coerce")
+            if pd.notna(d):
+                date_cols.append(c)
+                date_map[c] = pd.to_datetime(d.date())
 
-    def find_idx_contains(needle):
-        n = norm_txt(needle)
-        for j, v in enumerate(meta_cols):
-            if n in norm_txt(v):
-                return j
-        return None
+    marque = extract_marque_from_filename(filename)
 
-    idx_chaine = find_idx_contains("Chaine")
-    idx_ecran = find_idx_contains("Ecran")
-    if idx_chaine is None or idx_ecran is None:
-        raise ValueError(f"PM ({pm_filename}): colonnes Chaine/Ecran introuvables.")
-
-    marque = extract_marque_from_filename(pm_filename)
-    data = df.iloc[date_header_row + 1:].copy().dropna(how="all")
-
-    # ✅ Forward-fill de la chaîne + écran si besoin
-    last_sup = None
-    last_code = None
-
+    # data rows
     recs = []
-    for _, r in data.iterrows():
-        sup = r.iloc[idx_chaine]
-        codepm = r.iloc[idx_ecran]
+    last_sup = None
+    for r in range(date_row + 1, ws.max_row + 1):
+        sup = ws.cell(r, chaine_col).value
+        codepm = ws.cell(r, ecran_col).value
 
-        # forward fill
-        if (pd.isna(sup) or str(sup).strip() == "") and last_sup is not None:
+        # stop condition (TOTAL...)
+        if norm_txt(sup).startswith("TOTAL"):
+            break
+
+        # forward fill chaine (important)
+        if (sup is None or str(sup).strip() == ""):
             sup = last_sup
-        if not (pd.isna(sup) or str(sup).strip() == ""):
+        else:
             last_sup = sup
 
-        if (pd.isna(codepm) or str(codepm).strip() == "") and last_code is not None:
-            codepm = last_code
-        if not (pd.isna(codepm) or str(codepm).strip() == ""):
-            last_code = codepm
-
-        if pd.isna(codepm) or str(codepm).strip() == "":
+        if codepm is None or str(codepm).strip() == "":
             continue
 
-        for j in date_cols_idx:
-            cell = r.iloc[j]
-            if pd.isna(cell):
+        codepm_str = str(codepm).strip()
+        heure_pm = parse_hhmm_from_code(codepm_str)
+
+        for c in date_cols:
+            cell_val = merged_value(ws, r, c)
+            if cell_val is None:
                 continue
-            s = str(cell).strip().upper()
-            # ignore OFF / . / 0 / -
+            s = str(cell_val).strip().upper()
             if s in ("", "0", ".", "-", "OFF", "NAN", "NONE"):
                 continue
 
             recs.append({
-                "Date": date_map[j],
+                "Date": date_map[c],
                 "supportp": str(sup).strip(),
                 "Marque": marque,
-                "Code PM": str(codepm).strip(),
-                "Heure_PM": parse_hhmm_from_code(str(codepm)),
+                "Code PM": codepm_str,
+                "Heure_PM": heure_pm,
             })
 
     pmv = pd.DataFrame(recs)
     if pmv.empty:
         return pmv
 
-    pmv["support_norm"] = pmv["supportp"].apply(norm_txt)
     pmv["marque_norm"] = pmv["Marque"].apply(norm_txt)
+    pmv["support_norm"] = pmv["supportp"].apply(norm_txt)
     pmv["date_only"] = pd.to_datetime(pmv["Date"], errors="coerce").dt.date
     return pmv
 
 # =========================
-# Data Imperium -> Final
+# Data Imperium -> DF suivi
 # =========================
 
 def find_column(df: pd.DataFrame, candidates: list[str]):
@@ -328,65 +339,148 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     return out[FINAL_COLUMNS]
 
 # =========================
-# Matching simple (remplit Code PM + Décalage + Passage Sup)
+# Matching EXACT (Claude rules)
 # =========================
 
-def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date):
+def insert_minimal_row(d: date, sup: str, codepm: str, comment: str):
+    # Remplir uniquement A(datep) B(supportp) D(Code PM) E(Commentaire)
+    row = {c: None for c in FINAL_COLUMNS}
+    row["datep"] = d
+    row["supportp"] = sup
+    row["Code PM"] = codepm
+    row["Commentaire"] = comment
+    return row
+
+def fill_codepm_commentaire_claude(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date):
     df = df_final.copy()
+    df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
     df["marque_norm"] = df["Marque"].apply(norm_txt)
     df["support_norm"] = df["supportp"].apply(norm_txt)
-    df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
-    df["time_real"] = df["heure de diffusion"].apply(to_excel_time)
+    df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
 
     pm = pmv_all.copy()
     if pm.empty:
         return df[FINAL_COLUMNS]
 
-    out_rows = []
-    for (mn, sn, d), g in df.groupby(["marque_norm", "support_norm", "date_only"], dropna=False):
-        if d is None or d > max_date:
+    out_all = []
+    backlog = {}  # (marque_norm, support_norm) -> nb non diffusés non compensés
+
+    for (mn, sn), g_ms in df.groupby(["marque_norm", "support_norm"], dropna=False):
+        key = (mn, sn)
+        backlog.setdefault(key, 0)
+
+        g_ms = g_ms[g_ms["date_only"].notna()].copy()
+        g_ms = g_ms[g_ms["date_only"] <= max_date]
+        if g_ms.empty:
             continue
-        g = g.sort_values("time_real", na_position="last")
 
-        pm_day = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn) & (pm["date_only"] == d)].copy()
-        pm_day = pm_day.sort_values("Heure_PM")
+        for d in sorted(g_ms["date_only"].unique()):
+            real_day = g_ms[g_ms["date_only"] == d].copy().sort_values("t_real", na_position="last")
+            pm_day = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn) & (pm["date_only"] == d)].copy()
+            pm_day = pm_day.sort_values("Heure_PM", na_position="last")
 
-        used = set()
+            real_n = len(real_day)
+            pm_n = len(pm_day)
 
-        for _, row in g.iterrows():
-            comment = None
-            codepm = None
+            used = set()
+            filled_rows = []
+            inserted_rows = []
 
-            avail = pm_day.loc[~pm_day.index.isin(used)]
-            if avail.empty:
-                comment = "Passage supplémentaire"
+            # Helper closest one-to-one
+            def pick_closest(avail, t):
+                if avail.empty:
+                    return None, None
+                if t is None:
+                    return avail.iloc[0], None
+                tmp = avail.copy()
+                tmp["diff"] = tmp["Heure_PM"].apply(lambda x: minutes_diff(t, x) if x else 999999)
+                pick = tmp.sort_values("diff").iloc[0]
+                return pick, float(pick["diff"])
+
+            # === CASE equal: chrono
+            if real_n == pm_n:
+                for i in range(real_n):
+                    r = real_day.iloc[i].copy()
+                    p = pm_day.iloc[i]
+                    r["Code PM"] = p["Code PM"]
+                    # Décalage only
+                    diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
+                    r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                    filled_rows.append(r)
+
+            # === CASE real < pm: closest + insert non diffusé
+            elif real_n < pm_n:
+                for i in range(real_n):
+                    r = real_day.iloc[i].copy()
+                    avail = pm_day.loc[~pm_day.index.isin(used)]
+                    pick, diff = pick_closest(avail, r["t_real"])
+                    if pick is not None:
+                        used.add(pick.name)
+                        r["Code PM"] = pick["Code PM"]
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                    else:
+                        r["Code PM"] = None
+                        r["Commentaire"] = "Passage supplémentaire"
+                    filled_rows.append(r)
+
+                remaining = pm_day.loc[~pm_day.index.isin(used)]
+                for _, p in remaining.iterrows():
+                    inserted_rows.append(insert_minimal_row(d, real_day.iloc[0]["supportp"], p["Code PM"], "Non diffusé"))
+                backlog[key] += len(remaining)
+
+            # === CASE real > pm: chrono then extras = Compensation / Passage sup
             else:
-                treal = row["time_real"]
-                if treal is None:
-                    pick = avail.iloc[0]
-                    diff = None
-                else:
-                    tmp = avail.copy()
-                    tmp["diff"] = tmp["Heure_PM"].apply(lambda t: minutes_diff(treal, t) if t else 999999)
-                    pick = tmp.sort_values("diff").iloc[0]
-                    diff = float(pick["diff"])
-                used.add(pick.name)
-                codepm = pick["Code PM"]
-                if diff is not None and diff > DECALAGE_MINUTES:
-                    comment = "Décalage"
+                for i in range(real_n):
+                    r = real_day.iloc[i].copy()
+                    if i < pm_n:
+                        p = pm_day.iloc[i]
+                        r["Code PM"] = p["Code PM"]
+                        diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                    else:
+                        r["Code PM"] = None
+                        if backlog[key] > 0:
+                            r["Commentaire"] = "Compensation"
+                            backlog[key] -= 1
+                        else:
+                            r["Commentaire"] = "Passage supplémentaire"
+                    filled_rows.append(r)
 
-            new_row = row.copy()
-            new_row["Code PM"] = codepm
-            new_row["Commentaire"] = comment
-            out_rows.append(new_row)
+            # ---- Merge & sort (ordre horaire)
+            df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame(columns=df.columns)
+            df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS)
 
-    df_out = pd.DataFrame(out_rows)
-    if df_out.empty:
-        return df[FINAL_COLUMNS]
-    return df_out[FINAL_COLUMNS]
+            # Tri: heure réelle si existe, sinon heure PM via Code PM (pour Non diffusé)
+            def sort_time(row):
+                t = to_excel_time(row.get("heure de diffusion"))
+                if t is not None:
+                    return t
+                return parse_hhmm_from_code(row.get("Code PM"))
+            if not df_filled.empty:
+                df_filled["_sort_t"] = df_filled.apply(lambda r: sort_time(r), axis=1)
+            if not df_insert.empty:
+                df_insert["_sort_t"] = df_insert.apply(lambda r: sort_time(r), axis=1)
+
+            out_day = []
+            if not df_filled.empty:
+                out_day.append(df_filled)
+            if not df_insert.empty:
+                out_day.append(df_insert)
+
+            out_day = pd.concat(out_day, ignore_index=True) if out_day else pd.DataFrame(columns=FINAL_COLUMNS)
+            out_day["_sort_t"] = out_day["_sort_t"].astype(object)
+            out_day = out_day.sort_values(["_sort_t"], na_position="last").drop(columns=["_sort_t"], errors="ignore")
+
+            out_all.append(out_day[FINAL_COLUMNS])
+
+    if not out_all:
+        return df_final[FINAL_COLUMNS]
+
+    out = pd.concat(out_all, ignore_index=True)
+    return out[FINAL_COLUMNS]
 
 # =========================
-# Build workbooks (feuille par support, template, no gridlines)
+# Build workbooks (template, no gridlines)
 # =========================
 
 def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame) -> bytes:
@@ -453,7 +547,7 @@ st.caption("Template chargé depuis le repo : TEMPLATE_SUIVI_FINAL.xlsx")
 tab1, tab2 = st.tabs(["Suivi Imperium", "Suivi Yumi (à brancher)"])
 
 with tab1:
-    st.subheader("Suivi Imperium — Data + PM (Code PM / Commentaire)")
+    st.subheader("Suivi Imperium — Data + PM (logique Claude complète)")
 
     template_ok = False
     try:
@@ -465,7 +559,6 @@ with tab1:
 
     data_in = st.file_uploader("1) Uploader DATA IMPERIUM", type=["xlsx"])
     pm_in = st.file_uploader("2) Uploader PM(s) validés", type=["xlsx"], accept_multiple_files=True)
-
     max_date = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
 
     if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok)):
@@ -479,17 +572,18 @@ with tab1:
                     df_imp = pd.read_excel(data_in)
                     df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
 
+                    # PMs (merge-aware)
                     pms = []
                     for f in pm_in:
-                        df_pm_raw = pd.read_excel(f, header=None)
-                        pmv = pm_grid_to_vertical(df_pm_raw, getattr(f, "name", "PM.xlsx"))
+                        pmv = pm_grid_to_vertical_openpyxl(f.getvalue(), getattr(f, "name", "PM.xlsx"))
                         if not pmv.empty:
                             pms.append(pmv)
                     pmv_all = pd.concat(pms, ignore_index=True) if pms else pd.DataFrame()
 
-                    # ✅ matching (Code PM devient rempli)
-                    df_final = fill_codepm_commentaire(df_final, pmv_all, max_date=max_date)
+                    # Matching complet + insert Non diffusé + Compensation
+                    df_final = fill_codepm_commentaire_claude(df_final, pmv_all, max_date=max_date)
 
+                    # 1 fichier par marque
                     client_files = {}
                     for marque in sorted(df_final["Marque"].dropna().unique()):
                         df_client = df_final[df_final["Marque"] == marque].copy()
@@ -501,7 +595,7 @@ with tab1:
 
                     st.session_state.client_files = client_files
                     st.session_state.zip_bytes = make_zip(client_files)
-                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés (Code PM rempli)"
+                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés (Code PM + Non diffusé + Compensation)"
 
             except Exception as e:
                 st.error(f"Erreur: {e}")
