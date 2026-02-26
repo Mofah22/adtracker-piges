@@ -9,9 +9,10 @@ import streamlit as st
 import openpyxl
 from copy import copy as pycopy
 
-# -------------------------
-# CONFIG TEMPLATE
-# -------------------------
+# =========================
+# CONFIG
+# =========================
+TEMPLATE_PATH = "TEMPLATE_SUIVI_FINAL.xlsx"  # doit exister dans le repo
 HEADER_ROW = 9
 DATA_START_ROW = 10
 
@@ -125,6 +126,13 @@ def make_zip(files: dict[str, bytes]) -> bytes:
     return bio.getvalue()
 
 # =========================
+# Template
+# =========================
+
+def load_template_workbook() -> openpyxl.Workbook:
+    return openpyxl.load_workbook(TEMPLATE_PATH)
+
+# =========================
 # PM parsing (grilles)
 # =========================
 
@@ -143,24 +151,10 @@ def extract_marque_from_filename(fname: str) -> str:
     marque = parts[0].strip() if parts else base.strip()
     return re.sub(r"\s+", " ", marque).strip()
 
-def parse_pm_duration(cell):
-    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
-        return None
-    s = str(cell).strip().lower()
-    if s == "":
-        return None
-    m = re.search(r"(\d+)\s*s", s)
-    if m:
-        return int(m.group(1))
-    if s.isdigit():
-        return int(s)
-    return None
-
 def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
     """
-    Retourne PM vertical:
-    Date | supportp | Marque | CodePM
-    (Heure PM dérivée de CodePM: 1600R -> 16:00)
+    PM grille -> vertical:
+    Date | supportp | Marque | Code PM | Heure_PM
     """
     df = df_raw.copy()
 
@@ -169,7 +163,6 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
         row_norm = [norm_txt(x) for x in row]
         return any(any(k in cell for k in keywords) for cell in row_norm)
 
-    # meta header row: CHAINE + ECRAN + contexte
     meta_header_row = None
     for i in range(min(len(df), 80)):
         if row_has(i, ["CHAINE"]) and row_has(i, ["ECRAN"]) and row_has(i, ["TRANCHE", "HORAIRE", "PROGRAMME", "AVANT", "APRES", "APRÈS"]):
@@ -178,7 +171,6 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
     if meta_header_row is None:
         raise ValueError(f"PM ({pm_filename}): ligne d’en-têtes introuvable.")
 
-    # date row
     date_header_row = None
     for i in range(meta_header_row, min(len(df), meta_header_row + 40)):
         row_vals = df.iloc[i].tolist()
@@ -191,7 +183,6 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
     meta_cols = df.iloc[meta_header_row].tolist()
     date_headers = df.iloc[date_header_row].tolist()
 
-    # idx -> date
     date_cols_idx, date_map = [], {}
     for j, v in enumerate(date_headers):
         d = pd.to_datetime(v, errors="coerce") if is_date_like(v) else pd.NaT
@@ -231,7 +222,6 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
                 "Marque": marque,
                 "Code PM": str(codepm).strip(),
                 "Heure_PM": parse_hhmm_from_code(str(codepm)),
-                "Duree_PM": parse_pm_duration(cell)
             })
 
     pmv = pd.DataFrame(recs)
@@ -240,25 +230,19 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
 
     pmv["support_norm"] = pmv["supportp"].apply(norm_txt)
     pmv["marque_norm"] = pmv["Marque"].apply(norm_txt)
+    pmv["date_only"] = pd.to_datetime(pmv["Date"], errors="coerce").dt.date
     return pmv
 
 # =========================
-# Template writing
+# Build output workbooks
 # =========================
 
-def load_template_from_upload(uploaded_file) -> openpyxl.Workbook:
-    bio = io.BytesIO(uploaded_file.getvalue())
-    return openpyxl.load_workbook(bio)
-
-def build_client_workbook(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame) -> bytes:
+def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame) -> bytes:
     wb = template_wb
-
     base_ws = wb.worksheets[0]
 
-    # style model row
     style_row_cells = [base_ws.cell(DATA_START_ROW, c) for c in range(1, len(FINAL_COLUMNS) + 1)]
 
-    # clear extra rows
     if base_ws.max_row > DATA_START_ROW:
         base_ws.delete_rows(DATA_START_ROW + 1, base_ws.max_row - DATA_START_ROW)
 
@@ -267,20 +251,14 @@ def build_client_workbook(template_wb: openpyxl.Workbook, client_name: str, df_c
         supports = ["Support"]
 
     for i, sup in enumerate(supports):
-        if i == 0:
-            ws = base_ws
-        else:
-            ws = wb.copy_worksheet(base_ws)
-
+        ws = base_ws if i == 0 else wb.copy_worksheet(base_ws)
         ws.title = safe_sheet_name(f"{client_name} - {str(sup).strip()}")
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
-        # clear model row values
         for c in range(1, len(FINAL_COLUMNS) + 1):
             ws.cell(DATA_START_ROW, c).value = None
 
-        # write
         for r_idx, row in enumerate(sub.itertuples(index=False), start=DATA_START_ROW):
             if r_idx > DATA_START_ROW:
                 ws.insert_rows(r_idx)
@@ -301,17 +279,15 @@ def build_client_workbook(template_wb: openpyxl.Workbook, client_name: str, df_c
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
 
-        # enforce header row
         for c, col in enumerate(FINAL_COLUMNS, start=1):
             ws.cell(HEADER_ROW, c).value = col
 
-    # remove any leftover extra sheets not used (optional)
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
 
 # =========================
-# Imperium DF builder + Matching PM
+# Data Imperium -> Final + Matching PM
 # =========================
 
 def find_column(df: pd.DataFrame, candidates: list[str]):
@@ -323,11 +299,11 @@ def find_column(df: pd.DataFrame, candidates: list[str]):
     return None
 
 def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.DataFrame:
-    # basic required
     col_date = find_column(df_imp, ["datep", "date"])
     col_sup  = find_column(df_imp, ["supportp", "support", "chaine", "station"])
     col_time = find_column(df_imp, ["heurep", "heure"])
     col_mar  = find_column(df_imp, ["marque"])
+
     if not all([col_date, col_sup, col_time, col_mar]):
         raise ValueError("DATA IMPERIUM: colonnes minimales manquantes (datep/supportp/heurep/marque).")
 
@@ -354,54 +330,39 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out["Code PM"] = None
     out["Commentaire"] = None
 
-    # reorder to FINAL_COLUMNS
     out = out[FINAL_COLUMNS]
     return out
 
-def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date, decalage_min=45):
-    """
-    Remplit Code PM + Commentaire:
-    - match par Marque + Support + Date
-    - assignation chronologique (par heure), en prenant l'écran PM le plus proche
-    - Décalage si diff > 45 min
-    - Passage supplémentaire si plus de diffusions
-    - Non diffusé: on ajoute des lignes PM restantes (optionnel) => ici ON N'AJOUTE PAS, on garde juste réalisé
-    """
+def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, decalage_min=45):
     df = df_final.copy()
     df["marque_norm"] = df["Marque"].apply(norm_txt)
     df["support_norm"] = df["supportp"].apply(norm_txt)
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
     df["time_real"] = df["heure de diffusion"].apply(to_excel_time)
 
-    pmv = pmv_all.copy()
-    if pmv.empty:
-        return df
+    if pmv_all is None or pmv_all.empty:
+        return df[FINAL_COLUMNS]
 
-    pmv["date_only"] = pd.to_datetime(pmv["Date"], errors="coerce").dt.date
-
-    # process per group
     out_rows = []
     for (mn, sn, d), g in df.groupby(["marque_norm", "support_norm", "date_only"], dropna=False):
         g = g.sort_values("time_real")
-        pm_day = pmv[(pmv["marque_norm"] == mn) & (pmv["support_norm"] == sn) & (pmv["date_only"] == d)].copy()
-
+        pm_day = pmv_all[(pmv_all["marque_norm"] == mn) & (pmv_all["support_norm"] == sn) & (pmv_all["date_only"] == d)].copy()
         used = set()
 
-        for idx, row in g.iterrows():
+        for _, row in g.iterrows():
             comment = ""
             codepm = ""
 
             if not pm_day.empty:
                 avail = pm_day.loc[~pm_day.index.isin(used)]
                 if not avail.empty:
-                    # pick closest by time
                     if row["time_real"] is None:
                         pick = avail.iloc[0]
                         diff = None
                     else:
-                        avail2 = avail.copy()
-                        avail2["diff"] = avail2["Heure_PM"].apply(lambda t: minutes_diff(row["time_real"], t) if t else 999999)
-                        pick = avail2.sort_values("diff").iloc[0]
+                        tmp = avail.copy()
+                        tmp["diff"] = tmp["Heure_PM"].apply(lambda t: minutes_diff(row["time_real"], t) if t else 999999)
+                        pick = tmp.sort_values("diff").iloc[0]
                         diff = pick["diff"]
 
                     used.add(pick.name)
@@ -420,70 +381,66 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             out_rows.append(new_row)
 
     df_out = pd.DataFrame(out_rows)
-
-    # cleanup helper cols
-    df_out = df_out[FINAL_COLUMNS]
-    return df_out
+    return df_out[FINAL_COLUMNS]
 
 # =========================
 # UI
 # =========================
 
 st.title("📊 Suivi Pige — Automatisation")
+st.caption("Le template est chargé automatiquement depuis le repo (TEMPLATE_SUIVI_FINAL.xlsx).")
 
 tab1, tab2 = st.tabs(["Suivi Imperium", "Suivi Yumi (à brancher)"])
 
 with tab1:
-    st.subheader("Génération Suivi Imperium (Data + PM)")
+    st.subheader("Suivi Imperium — 2 Uploads (Data + PM)")
 
-    template_in = st.file_uploader("0) Uploader le TEMPLATE FINAL (ex: SUIVI LE BERGER FINAL.xlsx)", type=["xlsx"])
+    # Template check
+    template_ok = False
+    try:
+        _ = load_template_workbook()
+        template_ok = True
+        st.success("Template OK ✅ (TEMPLATE_SUIVI_FINAL.xlsx trouvé dans le repo)")
+    except Exception as e:
+        st.error(
+            "Template introuvable ❌\n\n"
+            "➡️ Mets dans ton repo GitHub un fichier nommé exactement : **TEMPLATE_SUIVI_FINAL.xlsx**\n"
+            "Tu peux prendre `SUIVI LE BERGER FINAL .xlsx` et le renommer.\n\n"
+            f"Détail: {e}"
+        )
+
     data_in = st.file_uploader("1) Uploader DATA IMPERIUM (filtré agence)", type=["xlsx"])
     pm_in = st.file_uploader("2) Uploader les PM validés (1 ou plusieurs)", type=["xlsx"], accept_multiple_files=True)
-
     max_date = st.date_input("3) Date max (pas de futur)", value=date.today())
 
-    if st.button("Lancer la génération (Imperium)", use_container_width=True):
-        if not template_in:
-            st.warning("Upload le TEMPLATE FINAL.")
-        elif not data_in:
+    if st.button("Lancer la génération (Imperium)", use_container_width=True, disabled=(not template_ok)):
+        if not data_in:
             st.warning("Upload DATA IMPERIUM.")
         elif not pm_in:
             st.warning("Upload au moins 1 fichier PM.")
         else:
             try:
-                # read template
-                template_wb_base = load_template_from_upload(template_in)
-
-                # read data
                 df_imp = pd.read_excel(data_in)
                 df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
 
-                # read PMs (grilles)
                 pms = []
                 for f in pm_in:
                     df_pm_raw = pd.read_excel(f, header=None)
                     pmv = pm_grid_to_vertical(df_pm_raw, getattr(f, "name", "PM.xlsx"))
                     if not pmv.empty:
                         pms.append(pmv)
+
                 pmv_all = pd.concat(pms, ignore_index=True) if pms else pd.DataFrame()
+                df_final = fill_codepm_commentaire(df_final, pmv_all, decalage_min=45)
 
-                # fill Code PM / Commentaire
-                df_final = fill_codepm_commentaire(df_final, pmv_all, max_date=max_date, decalage_min=45)
-
-                # build 1 file per client
                 client_files = {}
-
                 for marque in sorted(df_final["Marque"].dropna().unique()):
                     df_client = df_final[df_final["Marque"] == marque].copy()
                     df_client = df_client.sort_values(["datep", "supportp", "heure de diffusion"], na_position="last")
 
-                    # fresh copy of template workbook per client
-                    template_bio = io.BytesIO()
-                    template_wb_base.save(template_bio)
-                    template_bio.seek(0)
-                    template_wb = openpyxl.load_workbook(template_bio)
-
-                    xlsx_bytes = build_client_workbook(template_wb, marque, df_client)
+                    # fresh template copy per client
+                    template_wb_base = load_template_workbook()
+                    xlsx_bytes = build_client_workbook_from_template(template_wb_base, marque, df_client)
                     client_files[f"Suivi_{marque}.xlsx"] = xlsx_bytes
 
                 zip_bytes = make_zip(client_files)
@@ -514,4 +471,4 @@ with tab1:
 
 with tab2:
     st.subheader("Suivi Yumi (à brancher)")
-    st.info("Dès que tu m’envoies DATA YUMI + 1 fichier final template Yumi, je branche la même logique.")
+    st.info("Dès que tu m’envoies un exemple DATA YUMI + son template final, je branche la même logique.")
