@@ -96,6 +96,7 @@ def to_excel_time(val):
     if isinstance(val, pd.Timestamp):
         return val.to_pydatetime().time()
 
+    # numpy datetime64
     try:
         import numpy as np
         if isinstance(val, np.datetime64):
@@ -111,6 +112,7 @@ def to_excel_time(val):
         seconds = max(0, min(seconds, 86399))
         return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
 
+    # string
     try:
         s = str(val).strip().replace("h", ":").replace("H", ":")
         t = pd.to_datetime(s, errors="coerce")
@@ -123,9 +125,9 @@ def to_excel_time(val):
 
 def parse_codepm_time(code_pm: str):
     """
-    Retourne (time, is_overnight)
-    - 1600R -> (16:00, False)
-    - 2500R -> (01:00, True)  (>=24h)
+    Retourne (time, overnight_bool)
+    - 1600R -> 16:00, False
+    - 2500R -> 01:00, True
     """
     if code_pm is None:
         return None, False
@@ -145,11 +147,10 @@ def parse_codepm_time(code_pm: str):
     if mm < 0 or mm > 59:
         return None, False
 
-    # ✅ support des heures 24..29
     overnight = False
     if hh >= 24:
         overnight = True
-        hh = hh - 24  # 25:00 -> 01:00 (pour matching)
+        hh = hh - 24
 
     if 0 <= hh <= 23:
         return time(hh, mm, 0), overnight
@@ -177,7 +178,7 @@ def load_template_workbook() -> openpyxl.Workbook:
     return openpyxl.load_workbook(TEMPLATE_PATH)
 
 # =========================
-# PM parsing (OpenPyXL merge-aware)
+# PM parsing (merge-aware)
 # =========================
 
 def extract_marque_from_filename(fname: str) -> str:
@@ -210,8 +211,8 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
 
     # meta row
     meta_row = None
-    for r in range(1, min(ws.max_row, 110) + 1):
-        row_vals = [norm_txt(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 80) + 1)]
+    for r in range(1, min(ws.max_row, 120) + 1):
+        row_vals = [norm_txt(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 90) + 1)]
         if any("CHAINE" in v for v in row_vals) and any("ECRAN" in v for v in row_vals) and (
             any("TRANCHE" in v for v in row_vals) or any("HORAIRE" in v for v in row_vals) or any("PROGRAMME" in v for v in row_vals)
         ):
@@ -222,9 +223,9 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
 
     # date row
     date_row = None
-    for r in range(meta_row, min(ws.max_row, meta_row + 70) + 1):
+    for r in range(meta_row, min(ws.max_row, meta_row + 80) + 1):
         cnt = 0
-        for c in range(1, min(ws.max_column, 220) + 1):
+        for c in range(1, min(ws.max_column, 240) + 1):
             if is_date_like_any(ws.cell(r, c).value):
                 cnt += 1
         if cnt >= 2:
@@ -233,10 +234,10 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
     if date_row is None:
         raise ValueError(f"PM ({filename}): ligne des dates introuvable.")
 
-    # locate columns
+    # columns
     chaine_col = None
     ecran_col = None
-    for c in range(1, min(ws.max_column, 80) + 1):
+    for c in range(1, min(ws.max_column, 90) + 1):
         v = norm_txt(ws.cell(meta_row, c).value)
         if "CHAINE" in v and chaine_col is None:
             chaine_col = c
@@ -246,9 +247,8 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
         raise ValueError(f"PM ({filename}): colonnes Chaine/Ecran introuvables.")
 
     # date columns
-    date_cols = []
-    date_map = {}
-    for c in range(1, min(ws.max_column, 220) + 1):
+    date_cols, date_map = [], {}
+    for c in range(1, min(ws.max_column, 240) + 1):
         v = ws.cell(date_row, c).value
         if is_date_like_any(v):
             d = pd.to_datetime(v, errors="coerce")
@@ -267,7 +267,8 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
         if norm_txt(sup).startswith("TOTAL"):
             break
 
-        if (sup is None or str(sup).strip() == ""):
+        # forward fill chaine
+        if sup is None or str(sup).strip() == "":
             sup = last_sup
         else:
             last_sup = sup
@@ -292,7 +293,7 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
                 "Marque": marque,
                 "Code PM": codepm_str,
                 "Heure_PM": t_pm,
-                "Overnight": overnight,  # ✅ pour éviter faux Décalage
+                "Overnight": overnight,
             })
 
     pmv = pd.DataFrame(recs)
@@ -348,7 +349,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     return out[FINAL_COLUMNS]
 
 # =========================
-# Matching (Claude rules + insert rows A,B,D,E)
+# Matching Claude + insert rows A,B,D,E
 # =========================
 
 def insert_minimal_row(d: date, sup: str, codepm: str, comment: str):
@@ -413,16 +414,14 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
                     p = pm_day.iloc[i]
                     r["Code PM"] = p["Code PM"]
 
-                    # Décalage: uniquement si pas overnight
                     diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
                     if (not bool(p.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
                         r["Commentaire"] = "Décalage"
                     else:
                         r["Commentaire"] = None
-
                     filled_rows.append(r)
 
-            # real < pm => closest + Non diffusé lines
+            # real < pm => closest + Non diffusé
             elif real_n < pm_n:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -432,7 +431,6 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
                     if pick is not None:
                         used.add(pick.name)
                         r["Code PM"] = pick["Code PM"]
-
                         if (not bool(pick.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
                         else:
@@ -440,7 +438,6 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
                     else:
                         r["Code PM"] = None
                         r["Commentaire"] = "Passage supplémentaire"
-
                     filled_rows.append(r)
 
                 remaining = pm_day.loc[~pm_day.index.isin(used)]
@@ -448,14 +445,13 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
                     inserted_rows.append(insert_minimal_row(d, real_day.iloc[0]["supportp"], p["Code PM"], "Non diffusé"))
                 backlog[key] += len(remaining)
 
-            # real > pm => chrono + extra => Compensation/Passage sup
+            # real > pm => chrono + extras
             else:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
                     if i < pm_n:
                         p = pm_day.iloc[i]
                         r["Code PM"] = p["Code PM"]
-
                         diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
                         if (not bool(p.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
@@ -473,7 +469,7 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame(columns=df.columns)
             df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS)
 
-            # sort by heure réelle, sinon heure pm
+            # sort by heure réelle, sinon heure PM (code)
             def sort_time(row):
                 t = to_excel_time(row.get("heure de diffusion"))
                 if t is not None:
@@ -500,10 +496,6 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
     if not out_all:
         return df_final[FINAL_COLUMNS]
     return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS]
-
-# helper used in sort_time
-def parse_codepm_time(code_pm: str):
-    return parse_codepm_time(code_pm)
 
 # =========================
 # Build workbooks (template, no gridlines)
@@ -593,7 +585,6 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                 df_imp = pd.read_excel(data_in)
                 df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
 
-                # PM merge-aware
                 pms = []
                 for f in pm_in:
                     pms.append(pm_grid_to_vertical_openpyxl(f.getvalue(), getattr(f, "name", "PM.xlsx")))
@@ -612,7 +603,7 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
 
                 st.session_state.client_files = client_files
                 st.session_state.zip_bytes = make_zip(client_files)
-                st.session_state.last_run_info = f"{len(client_files)} fichiers générés (2500R supporté)"
+                st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
 
         except Exception as e:
             st.error(f"Erreur: {e}")
