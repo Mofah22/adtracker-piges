@@ -41,8 +41,44 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # =========================================================
-# --- FONCTIONS DE PARSING / NORMALISATION ---
+# --- OUTILS ROBUSTES (FIX dtype) ---
 # =========================================================
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Nettoie/flatten les colonnes (y compris MultiIndex) pour éviter bugs dtype."""
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        new_cols = []
+        for tup in df.columns:
+            parts = [str(x).strip() for x in tup if x is not None and str(x).strip().lower() != "nan"]
+            col = " ".join(parts).strip() if parts else ""
+            new_cols.append(col)
+        df.columns = new_cols
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+
+    # Nettoyage “Unnamed”
+    df.columns = [re.sub(r"^Unnamed:.*$", "", c).strip() for c in df.columns]
+    # Si certains noms deviennent vides, on les remplace
+    fixed = []
+    for i, c in enumerate(df.columns):
+        fixed.append(c if c else f"COL_{i}")
+    df.columns = fixed
+
+    return df
+
+def get_series(df: pd.DataFrame, col: str):
+    """
+    Retourne toujours une Série.
+    Si df[col] renvoie un DataFrame (doublons/MultiIndex), on prend la 1ère colonne.
+    """
+    if col not in df.columns:
+        return None
+    x = df[col]
+    if isinstance(x, pd.DataFrame):
+        return x.iloc[:, 0]
+    return x
 
 def parse_time(t):
     """Convertit divers formats d'heure (20h30, 20:30, float Excel) en objet time."""
@@ -53,7 +89,6 @@ def parse_time(t):
     if isinstance(t, datetime):
         return t.time()
 
-    # Gestion des nombres décimaux Excel (ex: 0.85)
     if isinstance(t, (float, int)):
         seconds = int(round(float(t) * 86400))
         seconds = max(0, min(seconds, 86399))
@@ -74,12 +109,14 @@ def is_date_val(val):
     s = str(val).strip()
     return bool(re.search(r'\d{1,2}[/-]\d{1,2}|\d{4}-\d{2}-\d{2}', s))
 
+# =========================================================
+# --- STANDARDISATION PM ---
+# =========================================================
+
 def standardize_pm_columns(df):
-    """
-    Standardise les colonnes d'un PM en évitant les doublons (Date, Heure, etc.).
-    Fix principal pour l'erreur: 'DataFrame' object has no attribute 'dtype'
-    (arrive quand df['Date'] renvoie un DataFrame à cause de colonnes dupliquées).
-    """
+    """Standardise PM (Date/Heure/Marque/Support/Code_Ecran) + anti-doublons + conversions safe."""
+    df = normalize_columns(df)
+
     def find_col(keys):
         for c in df.columns:
             cl = str(c).lower().strip()
@@ -94,37 +131,31 @@ def standardize_pm_columns(df):
     col_code   = find_col(['code', 'ecran', 'écran'])
 
     rename = {}
-
-    # ⚠️ Ne pas renommer vers un nom qui existe déjà => évite Date en double, etc.
-    if col_date and 'Date' not in df.columns:
-        rename[col_date] = 'Date'
-    if col_heure and 'Heure' not in df.columns:
-        rename[col_heure] = 'Heure'
-    if col_marque and 'Marque' not in df.columns:
-        rename[col_marque] = 'Marque'
-    if col_sup and 'Support' not in df.columns:
-        rename[col_sup] = 'Support'
-    if col_code and 'Code_Ecran' not in df.columns:
-        rename[col_code] = 'Code_Ecran'
+    if col_date:   rename[col_date] = 'Date'
+    if col_heure:  rename[col_heure] = 'Heure'
+    if col_marque: rename[col_marque] = 'Marque'
+    if col_sup:    rename[col_sup] = 'Support'
+    if col_code:   rename[col_code] = 'Code_Ecran'
 
     df2 = df.rename(columns=rename).copy()
+    # Supprimer colonnes dupliquées (même après flatten)
+    df2 = df2.loc[:, ~pd.Index(df2.columns).duplicated()].copy()
 
-    # ✅ Supprimer toutes colonnes dupliquées (garder la 1ère occurrence)
-    df2 = df2.loc[:, ~df2.columns.duplicated()].copy()
+    # Conversions SAFE (Date/Heure toujours Série)
+    s_date = get_series(df2, 'Date')
+    if s_date is not None:
+        df2['Date'] = pd.to_datetime(s_date, errors='coerce')
 
-    # Conversions safe
-    if 'Date' in df2.columns:
-        df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce')
-    if 'Heure' in df2.columns:
-        df2['Heure'] = df2['Heure'].apply(parse_time)
+    s_heure = get_series(df2, 'Heure')
+    if s_heure is not None:
+        df2['Heure'] = s_heure.apply(parse_time)
 
     return df2
 
 def transform_pm_horizontal(df):
-    """
-    Détecte et redresse un PM horizontal (dates en colonnes) en format vertical.
-    Si déjà vertical, standardise juste les colonnes.
-    """
+    """Détecte PM horizontal -> vertical. Sinon retourne PM vertical standardisé."""
+    df = normalize_columns(df)
+
     header_idx = -1
     for i in range(min(len(df), 25)):
         row = df.iloc[i]
@@ -132,13 +163,13 @@ def transform_pm_horizontal(df):
             header_idx = i
             break
 
-    # --- Si déjà vertical : on standardise juste les colonnes
     if header_idx == -1:
         return standardize_pm_columns(df)
 
-    # --- Sinon, logique “horizontal -> vertical”
-    df.columns = [c if not pd.isna(c) else f"Info_{i}" for i, c in enumerate(df.iloc[header_idx])]
+    # Horizontal -> vertical
+    df.columns = [c if str(c).strip() != "" else f"Info_{i}" for i, c in enumerate(df.iloc[header_idx])]
     df = df.iloc[header_idx + 1:].reset_index(drop=True)
+    df = normalize_columns(df)
 
     meta_cols = [c for c in df.columns if not is_date_val(c)]
     date_cols = [c for c in df.columns if is_date_val(c)]
@@ -153,22 +184,13 @@ def transform_pm_horizontal(df):
     df_vert = df_vert.dropna(subset=['Code_Ecran'])
     df_vert = df_vert[~df_vert['Code_Ecran'].astype(str).str.strip().isin(['0', '', 'nan', 'None'])]
 
-    # Standardisation finale + anti-doublons
-    df_vert = standardize_pm_columns(df_vert)
-
-    if 'Code_Ecran' not in df_vert.columns:
-        if 'Code Ecran' in df_vert.columns:
-            df_vert = df_vert.rename(columns={'Code Ecran': 'Code_Ecran'})
-
-    df_vert = df_vert.loc[:, ~df_vert.columns.duplicated()].copy()
-    return df_vert
+    return standardize_pm_columns(df_vert)
 
 # =========================================================
 # --- EXCEL TEMPLATE ---
 # =========================================================
 
 def apply_template(writer, sheet_name, df):
-    """Applique le style Agence : En-têtes ligne 9 bleue, metadata en haut."""
     ws = writer.sheets[sheet_name]
     blue_fill = PatternFill(start_color='7289DA', end_color='7289DA', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
@@ -179,12 +201,10 @@ def apply_template(writer, sheet_name, df):
         bottom=Side(style='thin')
     )
 
-    # Metadata (Lignes 4-6)
     ws["A4"], ws["B4"] = "DATE GÉNÉRATION :", datetime.now().strftime("%d/%m/%Y")
     ws["A5"], ws["B5"] = "CLIENT :", str(df['Marque'].iloc[0]) if 'Marque' in df.columns and not df.empty else "N/A"
     ws["A6"], ws["B6"] = "SUPPORT :", sheet_name
 
-    # Header Ligne 9
     for col_num, col_name in enumerate(df.columns, 1):
         cell = ws.cell(row=9, column=col_num, value=col_name)
         cell.fill = blue_fill
@@ -192,7 +212,6 @@ def apply_template(writer, sheet_name, df):
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border = border
 
-    # Données à partir de la Ligne 10
     for r_idx, row in enumerate(df.values, 10):
         for c_idx, value in enumerate(row, 1):
             cell = ws.cell(row=r_idx, column=c_idx, value=value)
@@ -206,7 +225,6 @@ def apply_template(writer, sheet_name, df):
             if "HEURE" in col_label:
                 cell.number_format = 'HH:MM:SS'
 
-    # Ajustement largeur colonnes
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 22
 
@@ -216,10 +234,13 @@ def apply_template(writer, sheet_name, df):
 
 def reconcile_all(df_brute, df_pm_total):
 
+    df_brute = normalize_columns(df_brute)
+    df_pm_total = standardize_pm_columns(df_pm_total)
+
     def find_col(df, keys):
         for c in df.columns:
-            col_low = str(c).lower().strip()
-            if any(k in col_low for k in keys):
+            cl = str(c).lower().strip()
+            if any(k in cl for k in keys):
                 return c
         return None
 
@@ -236,22 +257,19 @@ def reconcile_all(df_brute, df_pm_total):
             raise ValueError(f"La colonne '{k}' est introuvable dans la Data Brute.")
 
     df_b = df_brute.rename(columns={v: k for k, v in br_map.items() if v}).copy()
-    # ✅ Anti-doublons côté Data Brute aussi
-    df_b = df_b.loc[:, ~df_b.columns.duplicated()].copy()
+    df_b = df_b.loc[:, ~pd.Index(df_b.columns).duplicated()].copy()
 
-    df_b['Date'] = pd.to_datetime(df_b['Date'], errors='coerce')
-    df_b['Heure'] = df_b['Heure'].apply(parse_time)
+    # conversions safe
+    s_date = get_series(df_b, 'Date')
+    df_b['Date'] = pd.to_datetime(s_date, errors='coerce') if s_date is not None else pd.NaT
 
-    # Sécuriser le PM
-    df_pm_total = standardize_pm_columns(df_pm_total)
-    df_pm_total = df_pm_total.loc[:, ~df_pm_total.columns.duplicated()].copy()
+    s_heure = get_series(df_b, 'Heure')
+    df_b['Heure'] = s_heure.apply(parse_time) if s_heure is not None else None
 
-    if 'Date' not in df_pm_total.columns:
-        raise ValueError("Le PM unifié ne contient pas de colonne 'Date' après standardisation.")
-    if 'Marque' not in df_pm_total.columns:
-        raise ValueError("Le PM unifié ne contient pas de colonne 'Marque' après standardisation.")
-    if 'Support' not in df_pm_total.columns:
-        raise ValueError("Le PM unifié ne contient pas de colonne 'Support' après standardisation.")
+    # checks
+    for req in ['Date', 'Marque', 'Support']:
+        if req not in df_pm_total.columns:
+            raise ValueError(f"Le PM unifié ne contient pas '{req}' après standardisation.")
 
     output_files = {}
     marques = df_b['Marque'].dropna().unique()
@@ -259,7 +277,6 @@ def reconcile_all(df_brute, df_pm_total):
     for m in marques:
         b_m = df_b[df_b['Marque'] == m]
         p_m = df_pm_total[df_pm_total['Marque'] == m] if 'Marque' in df_pm_total.columns else pd.DataFrame()
-
         if p_m.empty:
             continue
 
@@ -324,7 +341,7 @@ def reconcile_all(df_brute, df_pm_total):
             with pd.ExcelWriter(bio, engine='openpyxl') as writer:
                 for sup in df_final_client['Support'].dropna().unique():
                     dfs = df_final_client[df_final_client['Support'] == sup].copy()
-                    sheet = str(sup)[:30] if str(sup).strip() != "" else "Support"
+                    sheet = str(sup)[:30] if str(sup).strip() else "Support"
                     dfs.to_excel(writer, index=False, sheet_name=sheet, startrow=8)
                     apply_template(writer, sheet, dfs)
 
@@ -350,6 +367,7 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         try:
             with st.spinner("Analyse et réconciliation en cours..."):
                 df_brute_raw = pd.read_excel(brute_in)
+                df_brute_raw = normalize_columns(df_brute_raw)
 
                 pms_vertical = []
                 for f in pm_in:
@@ -357,7 +375,7 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
                     pms_vertical.append(transform_pm_horizontal(df_pm_raw))
 
                 df_pm_unified = pd.concat(pms_vertical, ignore_index=True)
-                df_pm_unified = df_pm_unified.loc[:, ~df_pm_unified.columns.duplicated()].copy()
+                df_pm_unified = standardize_pm_columns(df_pm_unified)
 
                 final_outputs = reconcile_all(df_brute_raw, df_pm_unified)
 
@@ -382,4 +400,4 @@ if st.button("LANCER LE TRAITEMENT", use_container_width=True):
         st.warning("Veuillez charger les fichiers nécessaires.")
 
 st.divider()
-st.caption("AdTracker Pro v2.7 - Outil interne d'agence média | Marché Maroc.")
+st.caption("AdTracker Pro v2.8 - Outil interne d'agence média | Marché Maroc.")
