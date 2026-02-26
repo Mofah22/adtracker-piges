@@ -81,6 +81,37 @@ def norm_txt(x):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def normalize_brand(name: str) -> str:
+    """
+    Normalisation stricte pour matcher Marque ↔ PM
+    - enlève accents
+    - enlève mots parasites
+    - enlève dates/ramadan/tv/radio
+    - garde alphanum + espaces
+    """
+    s = norm_txt(name)
+    s = re.sub(r"\bPM\b", " ", s)
+    s = re.sub(r"\bRAMADAN\b", " ", s)
+    s = re.sub(r"\bTV\b|\bRADIO\b|\bOOH\b", " ", s)
+    s = re.sub(r"\bV\d+\b", " ", s)
+    s = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", s)
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def normalize_support(sup: str) -> str:
+    """
+    Normalise support:
+    '2M', '2M TV', '2m' => '2M'
+    'MBC 5', 'MBC5' => 'MBC5'
+    """
+    s = norm_txt(sup)
+    s = s.replace(" ", "")
+    s = re.sub(r"[^A-Z0-9]+", "", s)
+    # petits réglages
+    s = s.replace("TV", "")
+    return s
+
 def safe_sheet_name(s: str) -> str:
     s = re.sub(r"[:\\/*?\[\]]", " ", str(s))
     s = re.sub(r"\s+", " ", s).strip()
@@ -213,9 +244,7 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
     meta_row = None
     for r in range(1, min(ws.max_row, 120) + 1):
         row_vals = [norm_txt(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 90) + 1)]
-        if any("CHAINE" in v for v in row_vals) and any("ECRAN" in v for v in row_vals) and (
-            any("TRANCHE" in v for v in row_vals) or any("HORAIRE" in v for v in row_vals) or any("PROGRAMME" in v for v in row_vals)
-        ):
+        if any("CHAINE" in v for v in row_vals) and any("ECRAN" in v for v in row_vals):
             meta_row = r
             break
     if meta_row is None:
@@ -256,7 +285,7 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
                 date_cols.append(c)
                 date_map[c] = pd.to_datetime(d.date())
 
-    marque = extract_marque_from_filename(filename)
+    pm_brand = extract_marque_from_filename(filename)
 
     recs = []
     last_sup = None
@@ -288,9 +317,11 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
                 continue
 
             recs.append({
+                "PM_FILE_BRAND": pm_brand,                 # <-- clé PM
+                "PM_FILE_BRAND_N": normalize_brand(pm_brand),
                 "Date": date_map[c],
                 "supportp": str(sup).strip(),
-                "Marque": marque,
+                "support_norm": normalize_support(sup),
                 "Code PM": codepm_str,
                 "Heure_PM": t_pm,
                 "Overnight": overnight,
@@ -300,8 +331,6 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
     if pmv.empty:
         return pmv
 
-    pmv["marque_norm"] = pmv["Marque"].apply(norm_txt)
-    pmv["support_norm"] = pmv["supportp"].apply(norm_txt)
     pmv["date_only"] = pd.to_datetime(pmv["Date"], errors="coerce").dt.date
     return pmv
 
@@ -332,9 +361,12 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out = pd.DataFrame()
     out["datep"] = df["datep"]
     out["supportp"] = df[col_sup].astype(str).str.strip()
+    out["support_norm"] = out["supportp"].apply(normalize_support)
     out["heure de diffusion"] = df[col_time]
     out["Marque"] = df[col_mar].astype(str).str.strip()
+    out["Marque_norm"] = out["Marque"].apply(normalize_brand)
 
+    # optionals
     out["Message"] = df[find_column(df_imp, ["message", "storyboard"])] if find_column(df_imp, ["message", "storyboard"]) else None
     out["Produit"] = df[find_column(df_imp, ["produit"])] if find_column(df_imp, ["produit"]) else None
     out["RaisonSociale"] = df[find_column(df_imp, ["raisonsociale", "raison sociale"])] if find_column(df_imp, ["raisonsociale", "raison sociale"]) else None
@@ -346,54 +378,65 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
 
     out["Code PM"] = None
     out["Commentaire"] = None
-    return out[FINAL_COLUMNS]
+
+    # on retourne en gardant les colonnes helper (support_norm, Marque_norm)
+    return out
 
 # =========================
 # Insert minimal rows
 # =========================
 
-def insert_minimal_row(d: date, sup: str, codepm: str, comment: str):
-    # Remplir seulement A(datep) B(supportp) D(Code PM) E(Commentaire)
+def insert_minimal_row(d: date, sup_display: str, codepm: str, comment: str):
     row = {c: None for c in FINAL_COLUMNS}
     row["datep"] = d
-    row["supportp"] = sup
+    row["supportp"] = sup_display
     row["Code PM"] = codepm
     row["Commentaire"] = comment
     return row
 
 # =========================
-# Matching Claude + union dates (FIX "non diffusé le lendemain")
+# Matching PM -> Client (par fichier PM) + insertion Non diffusé
 # =========================
 
-def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_date: date):
-    df = df_final.copy()
+def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, max_date: date):
+    """
+    df_client: lignes réalisé (1 client) sur plusieurs supports
+    pm_client: PM vertical (1 client) sur plusieurs supports
+    """
+    df = df_client.copy()
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
-    df["marque_norm"] = df["Marque"].apply(norm_txt)
-    df["support_norm"] = df["supportp"].apply(norm_txt)
     df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
 
-    pm = pmv_all.copy()
-    if pm.empty:
-        return df[FINAL_COLUMNS]
+    pm = pm_client.copy()
+    pm = pm[pm["date_only"].notna()]
+    pm = pm[pm["date_only"] <= max_date]
 
     out_all = []
-    backlog = {}  # (marque,support) -> non diffusés non compensés
+    backlog = {}  # par support_norm
 
-    for (mn, sn), g_ms in df.groupby(["marque_norm", "support_norm"], dropna=False):
-        key = (mn, sn)
-        backlog.setdefault(key, 0)
+    # union supports (réalisé + pm)
+    supports_real = set(df["support_norm"].dropna().unique())
+    supports_pm = set(pm["support_norm"].dropna().unique())
+    all_supports = sorted(list(supports_real | supports_pm))
 
-        g_ms = g_ms[g_ms["date_only"].notna()].copy()
-        g_ms = g_ms[g_ms["date_only"] <= max_date]
+    for sn in all_supports:
+        backlog.setdefault(sn, 0)
 
-        pm_ms = pm[(pm["marque_norm"] == mn) & (pm["support_norm"] == sn)].copy()
-        pm_ms = pm_ms[pm_ms["date_only"].notna()]
-        pm_ms = pm_ms[pm_ms["date_only"] <= max_date]
+        real_s = df[df["support_norm"] == sn].copy()
+        pm_s = pm[pm["support_norm"] == sn].copy()
 
-        # ✅ union dates
-        dates_real = set(g_ms["date_only"].unique()) if not g_ms.empty else set()
-        dates_pm = set(pm_ms["date_only"].unique()) if not pm_ms.empty else set()
-        all_dates = sorted(list(dates_real | dates_pm))
+        # support display = si on a du réel => garder libellé réel, sinon libellé PM
+        sup_display = None
+        if not real_s.empty:
+            sup_display = str(real_s.iloc[0]["supportp"])
+        elif not pm_s.empty:
+            sup_display = str(pm_s.iloc[0]["supportp"])
+        else:
+            sup_display = str(sn)
+
+        dates_real = set(real_s["date_only"].dropna().unique())
+        dates_pm = set(pm_s["date_only"].dropna().unique())
+        all_dates = sorted(list((dates_real | dates_pm)))
 
         def pick_closest(avail, t):
             if avail.empty:
@@ -407,8 +450,11 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             return pick, float(pick["diff"])
 
         for d in all_dates:
-            real_day = g_ms[g_ms["date_only"] == d].copy().sort_values("t_real", na_position="last")
-            pm_day = pm_ms[pm_ms["date_only"] == d].copy().sort_values("Heure_PM", na_position="last")
+            if d > max_date:
+                continue
+
+            real_day = real_s[real_s["date_only"] == d].copy().sort_values("t_real", na_position="last")
+            pm_day = pm_s[pm_s["date_only"] == d].copy().sort_values("Heure_PM", na_position="last")
 
             real_n = len(real_day)
             pm_n = len(pm_day)
@@ -417,11 +463,11 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             filled_rows = []
             inserted_rows = []
 
-            # ✅ si aucun réalisé et PM existe => tout Non diffusé à la bonne date
+            # aucun réalisé mais PM => tout Non diffusé
             if real_n == 0 and pm_n > 0:
                 for _, p in pm_day.iterrows():
-                    inserted_rows.append(insert_minimal_row(d, p["supportp"], p["Code PM"], "Non diffusé"))
-                backlog[key] += pm_n
+                    inserted_rows.append(insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé"))
+                backlog[sn] += pm_n
 
             # égal => chrono
             elif real_n == pm_n:
@@ -458,10 +504,10 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
 
                 remaining = pm_day.loc[~pm_day.index.isin(used)]
                 for _, p in remaining.iterrows():
-                    inserted_rows.append(insert_minimal_row(d, p["supportp"], p["Code PM"], "Non diffusé"))
-                backlog[key] += len(remaining)
+                    inserted_rows.append(insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé"))
+                backlog[sn] += len(remaining)
 
-            # real > pm => chrono puis extras
+            # real > pm => chrono + extras
             else:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -475,9 +521,9 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
                             r["Commentaire"] = None
                     else:
                         r["Code PM"] = None
-                        if backlog[key] > 0:
+                        if backlog[sn] > 0:
                             r["Commentaire"] = "Compensation"
-                            backlog[key] -= 1
+                            backlog[sn] -= 1
                         else:
                             r["Commentaire"] = "Passage supplémentaire"
                     filled_rows.append(r)
@@ -507,10 +553,15 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, max_d
             out_day = pd.concat(out_day, ignore_index=True) if out_day else pd.DataFrame(columns=FINAL_COLUMNS)
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
 
+            # remettre supportp display sur lignes réelles aussi (cohérence)
+            if not out_day.empty and "supportp" in out_day.columns:
+                out_day["supportp"] = sup_display
+
+            # garder seulement colonnes template
             out_all.append(out_day[FINAL_COLUMNS])
 
     if not out_all:
-        return df_final[FINAL_COLUMNS]
+        return df_client[FINAL_COLUMNS]
     return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS]
 
 # =========================
@@ -587,7 +638,7 @@ except Exception as e:
     st.error(f"Template introuvable ❌ : {e}")
 
 data_in = st.file_uploader("1) Uploader DATA IMPERIUM", type=["xlsx"])
-pm_in = st.file_uploader("2) Uploader PM(s) validés", type=["xlsx"], accept_multiple_files=True)
+pm_in = st.file_uploader("2) Uploader PM(s) validés (1 ou plusieurs)", type=["xlsx"], accept_multiple_files=True)
 max_date = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
 
 if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok)):
@@ -598,28 +649,45 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
     else:
         try:
             with st.spinner("Génération en cours..."):
+                # Lire data
                 df_imp = pd.read_excel(data_in)
-                df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
+                df_all = build_final_df_from_imperium(df_imp, max_date=max_date)
 
-                pms = []
+                # Lire PMs en vertical + garder "brand file"
+                pm_all = []
                 for f in pm_in:
-                    pms.append(pm_grid_to_vertical_openpyxl(f.getvalue(), getattr(f, "name", "PM.xlsx")))
-                pmv_all = pd.concat([p for p in pms if not p.empty], ignore_index=True) if pms else pd.DataFrame()
+                    pmv = pm_grid_to_vertical_openpyxl(f.getvalue(), getattr(f, "name", "PM.xlsx"))
+                    if not pmv.empty:
+                        pm_all.append(pmv)
+                pmv_all = pd.concat(pm_all, ignore_index=True) if pm_all else pd.DataFrame()
 
-                df_final = fill_codepm_commentaire(df_final, pmv_all, max_date=max_date)
-
+                # Générer 1 fichier par client présent dans la data
                 client_files = {}
-                for marque in sorted(df_final["Marque"].dropna().unique()):
-                    df_client = df_final[df_final["Marque"] == marque].copy()
-                    df_client = df_client.sort_values(["datep", "supportp", "heure de diffusion"], na_position="last")
 
+                for client_name in sorted(df_all["Marque"].dropna().unique()):
+                    df_client_raw = df_all[df_all["Marque"] == client_name].copy()
+
+                    # sélectionner PM correspondant au client via nom de fichier (normalisé)
+                    client_norm = normalize_brand(client_name)
+                    pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
+
+                    # si pas exact match, fallback: containment
+                    if pm_client.empty and not pmv_all.empty:
+                        pm_client = pmv_all[
+                            pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
+                        ].copy()
+
+                    # remplir Code PM + insérer Non diffusé (même si support absent dans réalisé)
+                    df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, max_date=max_date)
+
+                    # écrire excel client
                     template_wb = load_template_workbook()
-                    xlsx_bytes = build_client_workbook_from_template(template_wb, marque, df_client)
-                    client_files[f"Suivi_{marque}.xlsx"] = xlsx_bytes
+                    xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done)
+                    client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
 
                 st.session_state.client_files = client_files
                 st.session_state.zip_bytes = make_zip(client_files)
-                st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
+                st.session_state.last_run_info = f"{len(client_files)} fichiers générés (PM appliqués par client + Non diffusé)"
 
         except Exception as e:
             st.error(f"Erreur: {e}")
