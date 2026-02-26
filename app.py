@@ -76,20 +76,49 @@ def safe_sheet_name(s: str) -> str:
     return s[:31] if len(s) > 31 else s
 
 def to_excel_time(val):
-    if pd.isna(val) or val is None:
+    """
+    ✅ FIX #2: convertit tous les formats possibles en time()
+    - time / datetime / pandas Timestamp / numpy datetime64
+    - float Excel (0.xx)
+    - string "16:09:05" / "16h09"
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
+
     if isinstance(val, time):
         return val
+
     if isinstance(val, datetime):
         return val.time()
+
     if isinstance(val, pd.Timestamp):
         return val.to_pydatetime().time()
+
+    # numpy datetime64
     try:
-        t = pd.to_datetime(str(val), errors="coerce")
+        import numpy as np
+        if isinstance(val, np.datetime64):
+            t = pd.to_datetime(val, errors="coerce")
+            if pd.notna(t):
+                return t.to_pydatetime().time()
+    except:
+        pass
+
+    # Excel float hour
+    if isinstance(val, (float, int)):
+        seconds = int(round(float(val) * 86400))
+        seconds = max(0, min(seconds, 86399))
+        return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+    # string time
+    try:
+        s = str(val).strip().replace("h", ":").replace("H", ":")
+        t = pd.to_datetime(s, errors="coerce")
         if pd.notna(t):
             return t.to_pydatetime().time()
     except:
         pass
+
     return None
 
 def parse_hhmm_from_code(code_pm: str):
@@ -238,30 +267,46 @@ def pm_grid_to_vertical(df_raw: pd.DataFrame, pm_filename: str) -> pd.DataFrame:
 # =========================
 
 def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame) -> bytes:
+    """
+    ✅ FIX #1: chaque feuille support part d’un template propre
+    -> on copie template_ws pour CHAQUE support, puis on supprime template_ws.
+    """
     wb = template_wb
-    base_ws = wb.worksheets[0]
+    template_ws = wb.worksheets[0]  # feuille modèle (sera supprimée à la fin)
 
-    style_row_cells = [base_ws.cell(DATA_START_ROW, c) for c in range(1, len(FINAL_COLUMNS) + 1)]
+    # style row model
+    style_row_cells = [template_ws.cell(DATA_START_ROW, c) for c in range(1, len(FINAL_COLUMNS) + 1)]
 
-    if base_ws.max_row > DATA_START_ROW:
-        base_ws.delete_rows(DATA_START_ROW + 1, base_ws.max_row - DATA_START_ROW)
+    def reset_sheet(ws):
+        # supprimer toutes les lignes au-delà de la ligne modèle
+        if ws.max_row > DATA_START_ROW:
+            ws.delete_rows(DATA_START_ROW + 1, ws.max_row - DATA_START_ROW)
+        # vider la ligne modèle
+        for c in range(1, len(FINAL_COLUMNS) + 1):
+            ws.cell(DATA_START_ROW, c).value = None
+        # remettre header ligne 9
+        for c, col in enumerate(FINAL_COLUMNS, start=1):
+            ws.cell(HEADER_ROW, c).value = col
+
+    # nettoyer le template une fois
+    reset_sheet(template_ws)
 
     supports = list(df_client["supportp"].dropna().unique())
     if not supports:
         supports = ["Support"]
 
-    for i, sup in enumerate(supports):
-        ws = base_ws if i == 0 else wb.copy_worksheet(base_ws)
+    for sup in supports:
+        ws = wb.copy_worksheet(template_ws)
         ws.title = safe_sheet_name(f"{client_name} - {str(sup).strip()}")
 
-        sub = df_client[df_client["supportp"] == sup].copy()
+        reset_sheet(ws)
 
-        for c in range(1, len(FINAL_COLUMNS) + 1):
-            ws.cell(DATA_START_ROW, c).value = None
+        sub = df_client[df_client["supportp"] == sup].copy()
 
         for r_idx, row in enumerate(sub.itertuples(index=False), start=DATA_START_ROW):
             if r_idx > DATA_START_ROW:
                 ws.insert_rows(r_idx)
+                # copier style ligne modèle
                 for c in range(1, len(FINAL_COLUMNS) + 1):
                     src = style_row_cells[c - 1]
                     dst = ws.cell(r_idx, c)
@@ -279,8 +324,8 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
 
-        for c, col in enumerate(FINAL_COLUMNS, start=1):
-            ws.cell(HEADER_ROW, c).value = col
+    # supprimer la feuille modèle du fichier final
+    wb.remove(template_ws)
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -314,7 +359,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out = pd.DataFrame()
     out["datep"] = df["datep"]
     out["supportp"] = df[col_sup].astype(str).str.strip()
-    out["heure de diffusion"] = df[col_time]
+    out["heure de diffusion"] = df[col_time]  # on convertira au moment d’écrire
     out["Marque"] = df[col_mar].astype(str).str.strip()
 
     # optionals
@@ -388,7 +433,7 @@ def fill_codepm_commentaire(df_final: pd.DataFrame, pmv_all: pd.DataFrame, decal
 # =========================
 
 st.title("📊 Suivi Pige — Automatisation")
-st.caption("Le template est chargé automatiquement depuis le repo (TEMPLATE_SUIVI_FINAL.xlsx).")
+st.caption("Le template est chargé automatiquement depuis le repo : TEMPLATE_SUIVI_FINAL.xlsx")
 
 tab1, tab2 = st.tabs(["Suivi Imperium", "Suivi Yumi (à brancher)"])
 
@@ -405,7 +450,6 @@ with tab1:
         st.error(
             "Template introuvable ❌\n\n"
             "➡️ Mets dans ton repo GitHub un fichier nommé exactement : **TEMPLATE_SUIVI_FINAL.xlsx**\n"
-            "Tu peux prendre `SUIVI LE BERGER FINAL .xlsx` et le renommer.\n\n"
             f"Détail: {e}"
         )
 
@@ -420,9 +464,11 @@ with tab1:
             st.warning("Upload au moins 1 fichier PM.")
         else:
             try:
+                # Lire data
                 df_imp = pd.read_excel(data_in)
                 df_final = build_final_df_from_imperium(df_imp, max_date=max_date)
 
+                # Lire PMs
                 pms = []
                 for f in pm_in:
                     df_pm_raw = pd.read_excel(f, header=None)
@@ -431,16 +477,19 @@ with tab1:
                         pms.append(pmv)
 
                 pmv_all = pd.concat(pms, ignore_index=True) if pms else pd.DataFrame()
+
+                # Remplir Code PM / Commentaire
                 df_final = fill_codepm_commentaire(df_final, pmv_all, decalage_min=45)
 
+                # Générer 1 fichier par marque
                 client_files = {}
                 for marque in sorted(df_final["Marque"].dropna().unique()):
                     df_client = df_final[df_final["Marque"] == marque].copy()
                     df_client = df_client.sort_values(["datep", "supportp", "heure de diffusion"], na_position="last")
 
-                    # fresh template copy per client
-                    template_wb_base = load_template_workbook()
-                    xlsx_bytes = build_client_workbook_from_template(template_wb_base, marque, df_client)
+                    # Fresh template copy par client
+                    template_wb = load_template_workbook()
+                    xlsx_bytes = build_client_workbook_from_template(template_wb, marque, df_client)
                     client_files[f"Suivi_{marque}.xlsx"] = xlsx_bytes
 
                 zip_bytes = make_zip(client_files)
