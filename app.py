@@ -236,10 +236,12 @@ def merged_value(ws, r, c):
             return ws.cell(rng.min_row, rng.min_col).value
     return val
 
-def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    ws = wb.active
-
+def _parse_one_pm_sheet(ws, pm_brand: str, filename: str, sheet_name: str) -> list:
+    """
+    Tente de parser une feuille PM.
+    Retourne une liste de dicts (peut être vide si la feuille n'est pas reconnue).
+    """
+    # ── Chercher la ligne d'en-têtes (CHAINE + ECRAN) ──────────────────────
     meta_row = None
     for r in range(1, min(ws.max_row, 120) + 1):
         row_vals = [norm_txt(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 90) + 1)]
@@ -247,22 +249,23 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
             meta_row = r
             break
     if meta_row is None:
-        raise ValueError(f"PM ({filename}): ligne d'en-têtes introuvable.")
+        return []   # feuille non reconnue → on l'ignore silencieusement
 
+    # ── Chercher la ligne des dates ─────────────────────────────────────────
     date_row = None
     for r in range(meta_row, min(ws.max_row, meta_row + 80) + 1):
-        cnt = 0
-        for c in range(1, min(ws.max_column, 240) + 1):
-            if is_date_like_any(ws.cell(r, c).value):
-                cnt += 1
+        cnt = sum(
+            1 for c in range(1, min(ws.max_column, 240) + 1)
+            if is_date_like_any(ws.cell(r, c).value)
+        )
         if cnt >= 2:
             date_row = r
             break
     if date_row is None:
-        raise ValueError(f"PM ({filename}): ligne des dates introuvable.")
+        return []
 
-    chaine_col = None
-    ecran_col = None
+    # ── Colonnes Chaine & Ecran ─────────────────────────────────────────────
+    chaine_col = ecran_col = None
     for c in range(1, min(ws.max_column, 90) + 1):
         v = norm_txt(ws.cell(meta_row, c).value)
         if "CHAINE" in v and chaine_col is None:
@@ -270,8 +273,9 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
         if "ECRAN" in v and ecran_col is None:
             ecran_col = c
     if chaine_col is None or ecran_col is None:
-        raise ValueError(f"PM ({filename}): colonnes Chaine/Ecran introuvables.")
+        return []
 
+    # ── Colonnes de dates ───────────────────────────────────────────────────
     date_cols, date_map = [], {}
     for c in range(1, min(ws.max_column, 240) + 1):
         v = ws.cell(date_row, c).value
@@ -281,12 +285,11 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
                 date_cols.append(c)
                 date_map[c] = pd.to_datetime(d.date())
 
-    pm_brand = extract_marque_from_filename(filename)
-
+    # ── Parcourir les lignes de données ────────────────────────────────────
     recs = []
     last_sup = None
     for r in range(date_row + 1, ws.max_row + 1):
-        sup = ws.cell(r, chaine_col).value
+        sup    = ws.cell(r, chaine_col).value
         codepm = ws.cell(r, ecran_col).value
 
         if norm_txt(sup).startswith("TOTAL"):
@@ -300,8 +303,8 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
         if codepm is None or str(codepm).strip() == "":
             continue
 
-        codepm_str = str(codepm).strip()
-        t_pm, overnight = parse_codepm_time(codepm_str)
+        codepm_str       = str(codepm).strip()
+        t_pm, overnight  = parse_codepm_time(codepm_str)
 
         for c in date_cols:
             cell_val = merged_value(ws, r, c)
@@ -313,18 +316,47 @@ def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFra
 
             d = date_map[c]
             recs.append({
-                "PM_FILE_BRAND": pm_brand,
+                "PM_FILE_BRAND":   pm_brand,
                 "PM_FILE_BRAND_N": normalize_brand(pm_brand),
-                "Date": d,
-                "date_only": pd.to_datetime(d, errors="coerce").date(),
-                "supportp": str(sup).strip(),
-                "support_norm": normalize_support(sup),
-                "Code PM": codepm_str,
-                "Heure_PM": t_pm,
-                "Overnight": overnight,
+                "Date":            d,
+                "date_only":       pd.to_datetime(d, errors="coerce").date(),
+                "supportp":        str(sup).strip(),
+                "support_norm":    normalize_support(str(sup)),
+                "Code PM":         codepm_str,
+                "Heure_PM":        t_pm,
+                "Overnight":       overnight,
             })
 
-    return pd.DataFrame(recs)
+    return recs
+
+
+def pm_grid_to_vertical_openpyxl(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Lit TOUTES les feuilles du fichier PM et concatène les résultats.
+    Chaque feuille est parsée indépendamment ; les feuilles non reconnues
+    (sans ligne CHAINE/ECRAN) sont ignorées sans erreur.
+    """
+    wb       = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    pm_brand = extract_marque_from_filename(filename)
+
+    all_recs = []
+    sheets_parsed = 0
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        recs = _parse_one_pm_sheet(ws, pm_brand, filename, sheet_name)
+        if recs:
+            all_recs.extend(recs)
+            sheets_parsed += 1
+
+    if not all_recs:
+        raise ValueError(
+            f"PM ({filename}) : aucune feuille reconnue "
+            f"(feuilles présentes : {wb.sheetnames}). "
+            "Vérifier que les colonnes CHAINE et ECRAN sont présentes."
+        )
+
+    return pd.DataFrame(all_recs)
 
 # =========================
 # Data Imperium -> DF suivi
