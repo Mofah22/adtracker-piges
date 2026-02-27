@@ -435,8 +435,18 @@ def match_pm_to_client(client_name: str, client_norm: str, pmv_all: pd.DataFrame
     return pd.DataFrame()
 
 # =========================
-# FIX 3 : fill_codepm_commentaire_per_client corrigé
+# FIX 3 : fill_codepm_commentaire_per_client — réécriture robuste
 # =========================
+
+def series_to_final_dict(s: pd.Series, sup_display: str) -> dict:
+    """Convertit une Series réalisé en dict FINAL_COLUMNS propre."""
+    d = {col: None for col in FINAL_COLUMNS}
+    for col in FINAL_COLUMNS:
+        if col in s.index:
+            d[col] = s[col]
+    d["supportp"] = sup_display
+    return d
+
 
 def fill_codepm_commentaire_per_client(
     df_client: pd.DataFrame,
@@ -446,46 +456,52 @@ def fill_codepm_commentaire_per_client(
 ):
     df = df_client.copy()
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
-    df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
+    df["t_real"]    = df["heure de diffusion"].apply(to_excel_time)
 
     # Valeurs à propager dans les lignes "Non diffusé"
-    _marque  = marque_display or (df["Marque"].iloc[0] if "Marque" in df.columns and not df.empty else None)
-    _produit = df["Produit"].iloc[0] if "Produit" in df.columns and not df.empty else None
-    _raison  = df["RaisonSociale"].iloc[0] if "RaisonSociale" in df.columns and not df.empty else None
+    _marque  = marque_display or (str(df["Marque"].iloc[0]) if "Marque" in df.columns and not df.empty else None)
+    _produit = str(df["Produit"].iloc[0]) if ("Produit" in df.columns and not df.empty and pd.notna(df["Produit"].iloc[0])) else None
+    _raison  = str(df["RaisonSociale"].iloc[0]) if ("RaisonSociale" in df.columns and not df.empty and pd.notna(df["RaisonSociale"].iloc[0])) else None
 
+    # S'assurer que toutes les FINAL_COLUMNS existent dans df
+    for col in FINAL_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    # Pas de PM → retourner tel quel (sans Code PM ni Commentaire)
     if pm_client is None or pm_client.empty:
-        base = df.copy()
-        for col in FINAL_COLUMNS:
-            if col not in base.columns:
-                base[col] = None
-        return base[[c for c in FINAL_COLUMNS if c in base.columns or True]].reindex(columns=FINAL_COLUMNS)
+        return df.reindex(columns=FINAL_COLUMNS)
 
     pm = pm_client.copy()
     pm = pm[pm["date_only"].notna()]
     pm = pm[pm["date_only"] <= max_date]
 
-    # S'assurer que FINAL_COLUMNS existent dans df
-    for col in FINAL_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-
-    out_all = []
-    backlog = {}   # nb de "Non diffusé" cumulés par support, non compensés
+    out_all  = []
+    backlog  = {}   # non diffusés non compensés, par support_norm
 
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm   = set(pm["support_norm"].dropna().unique())
     all_supports  = sorted(list(supports_real | supports_pm))
 
-    def pick_closest(avail_df, t_real):
-        """Retourne (row_Series, diff_minutes | None)."""
+    def pick_closest_pm(avail_df: pd.DataFrame, t_real):
+        """Retourne (index_pm, code_pm, diff_minutes | None)."""
         if avail_df.empty:
-            return None, None
+            return None, None, None
         if t_real is None:
-            return avail_df.iloc[0], None
-        tmp = avail_df.copy()
-        tmp["_diff"] = tmp["Heure_PM"].apply(lambda x: minutes_diff(t_real, x) if x else 999999)
-        best = tmp.sort_values("_diff").iloc[0]
-        return best, float(best["_diff"])
+            row = avail_df.iloc[0]
+            return row.name, row["Code PM"], None
+        diffs = avail_df["Heure_PM"].apply(lambda x: minutes_diff(t_real, x) if x else 999999)
+        idx   = diffs.idxmin()
+        row   = avail_df.loc[idx]
+        return idx, row["Code PM"], float(diffs[idx])
+
+    def get_sort_key(row_dict: dict):
+        """Clé de tri : heure réelle d'abord, sinon heure extraite du Code PM."""
+        t = to_excel_time(row_dict.get("heure de diffusion"))
+        if t is not None:
+            return t
+        t2, _ = parse_codepm_time(row_dict.get("Code PM"))
+        return t2 if t2 is not None else time(23, 59, 59)
 
     for sn in all_supports:
         backlog.setdefault(sn, 0)
@@ -514,110 +530,89 @@ def fill_codepm_commentaire_per_client(
             real_n = len(real_day)
             pm_n   = len(pm_day)
 
-            used         = set()   # index PM déjà affectés
-            filled_rows  = []
-            inserted_rows = []
+            # Liste finale des dicts pour ce jour
+            day_dicts: list[dict] = []
 
-            # ── Cas : aucun réalisé, PM existe ──────────────────────────────
+            # ── Aucun réalisé, PM existe → tout en Non diffusé ──────────────
             if real_n == 0 and pm_n > 0:
                 for _, p in pm_day.iterrows():
-                    inserted_rows.append(
-                        insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé",
-                                           marque=_marque, produit=_produit, raison=_raison)
-                    )
+                    day_dicts.append(insert_minimal_row(
+                        d, sup_display, p["Code PM"], "Non diffusé",
+                        marque=_marque, produit=_produit, raison=_raison,
+                    ))
                 backlog[sn] += pm_n
 
-            # ── Cas : égalité ───────────────────────────────────────────────
+            # ── Égalité : affectation chrono 1-to-1 ─────────────────────────
             elif real_n == pm_n:
                 for i in range(real_n):
-                    r = real_day.iloc[i].copy()
-                    p = pm_day.iloc[i]
-                    r["Code PM"] = p["Code PM"]
+                    r   = real_day.iloc[i]
+                    p   = pm_day.iloc[i]
+                    rd  = series_to_final_dict(r, sup_display)
+                    rd["Code PM"] = p["Code PM"]
                     diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
                     overnight = bool(p.get("Overnight", False))
-                    r["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
-                    filled_rows.append(r)
+                    rd["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
+                    day_dicts.append(rd)
 
-            # ── Cas : moins réalisé que prévu ───────────────────────────────
+            # ── Moins réalisé que prévu : matching closest + Non diffusé ────
             elif real_n < pm_n:
+                used_pm_idx = set()
                 for i in range(real_n):
-                    r    = real_day.iloc[i].copy()
-                    avail = pm_day.loc[~pm_day.index.isin(used)]
-                    pick, diff = pick_closest(avail, r["t_real"])
-                    if pick is not None:
-                        used.add(pick.name)
-                        r["Code PM"] = pick["Code PM"]
-                        overnight = bool(pick.get("Overnight", False))
-                        r["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
-                    else:
-                        # Aucun PM disponible → surplus inattendu
-                        r["Code PM"] = None
-                        r["Commentaire"] = "Passage supplémentaire"
-                    filled_rows.append(r)
+                    r     = real_day.iloc[i]
+                    avail = pm_day.loc[~pm_day.index.isin(used_pm_idx)]
+                    idx_pm, code_pm, diff = pick_closest_pm(avail, r["t_real"])
 
-                remaining = pm_day.loc[~pm_day.index.isin(used)]
+                    rd = series_to_final_dict(r, sup_display)
+                    if idx_pm is not None:
+                        used_pm_idx.add(idx_pm)
+                        pm_row    = pm_day.loc[idx_pm]
+                        overnight = bool(pm_row.get("Overnight", False))
+                        rd["Code PM"]     = code_pm
+                        rd["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
+                    else:
+                        rd["Code PM"]     = None
+                        rd["Commentaire"] = "Passage supplémentaire"
+                    day_dicts.append(rd)
+
+                # PM restants → Non diffusé
+                remaining = pm_day.loc[~pm_day.index.isin(used_pm_idx)]
                 for _, p in remaining.iterrows():
-                    inserted_rows.append(
-                        insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé",
-                                           marque=_marque, produit=_produit, raison=_raison)
-                    )
+                    day_dicts.append(insert_minimal_row(
+                        d, sup_display, p["Code PM"], "Non diffusé",
+                        marque=_marque, produit=_produit, raison=_raison,
+                    ))
                 backlog[sn] += len(remaining)
 
-            # ── Cas : plus réalisé que prévu ────────────────────────────────
+            # ── Plus réalisé que prévu : PM d'abord, surplus ensuite ─────────
             else:  # real_n > pm_n
                 for i in range(real_n):
-                    r = real_day.iloc[i].copy()
+                    r  = real_day.iloc[i]
+                    rd = series_to_final_dict(r, sup_display)
+
                     if i < pm_n:
-                        p = pm_day.iloc[i]
-                        r["Code PM"] = p["Code PM"]
-                        diff = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
+                        p         = pm_day.iloc[i]
                         overnight = bool(p.get("Overnight", False))
-                        r["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
+                        diff      = minutes_diff(r["t_real"], p["Heure_PM"]) if (r["t_real"] and p["Heure_PM"]) else None
+                        rd["Code PM"]     = p["Code PM"]
+                        rd["Commentaire"] = "Décalage" if (not overnight and diff is not None and diff > DECALAGE_MINUTES) else None
                     else:
-                        r["Code PM"] = None
+                        rd["Code PM"] = None
                         if backlog[sn] > 0:
-                            r["Commentaire"] = "Compensation"
+                            rd["Commentaire"] = "Compensation"
                             backlog[sn] -= 1
                         else:
-                            r["Commentaire"] = "Passage supplémentaire"
-                    filled_rows.append(r)
+                            rd["Commentaire"] = "Passage supplémentaire"
+                    day_dicts.append(rd)
 
-            # ── Tri chronologique puis fusion ────────────────────────────────
-            def get_sort_time(row_dict):
-                # Priorité : heure réelle, sinon heure du Code PM
-                t = to_excel_time(row_dict.get("heure de diffusion"))
-                if t is not None:
-                    return t
-                t2, _ = parse_codepm_time(row_dict.get("Code PM"))
-                return t2 if t2 else time(23, 59, 59)
+            # ── Tri chronologique du jour ────────────────────────────────────
+            day_dicts_sorted = sorted(day_dicts, key=get_sort_key)
 
-            # Convertir filled_rows en liste de dicts pour uniformité
-            filled_dicts = []
-            for row in filled_rows:
-                if isinstance(row, pd.Series):
-                    filled_dicts.append(row.to_dict())
-                else:
-                    filled_dicts.append(row)
-
-            all_day = filled_dicts + inserted_rows
-
-            # Trier par heure
-            all_day_sorted = sorted(all_day, key=lambda r: get_sort_time(r))
-
-            # Construire le DataFrame du jour avec exactement FINAL_COLUMNS
-            day_rows = []
-            for rd in all_day_sorted:
-                day_row = {col: rd.get(col) for col in FINAL_COLUMNS}
-                day_row["supportp"] = sup_display   # forcer le bon display
-                day_rows.append(day_row)
-
-            if day_rows:
-                out_all.append(pd.DataFrame(day_rows, columns=FINAL_COLUMNS))
+            if day_dicts_sorted:
+                out_all.append(pd.DataFrame(day_dicts_sorted, columns=FINAL_COLUMNS))
 
     if out_all:
         return pd.concat(out_all, ignore_index=True).reindex(columns=FINAL_COLUMNS)
     else:
-        # Aucune date commune : retourner les lignes réalisées sans Code PM
         return df.reindex(columns=FINAL_COLUMNS)
 
 # =========================
