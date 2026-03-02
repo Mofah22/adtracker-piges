@@ -236,6 +236,17 @@ def find_column(df: pd.DataFrame, candidates: list[str]):
                 return c
     return None
 
+# ✅ NEW: borne max_date par la dernière date de la data brute
+def get_max_date_from_raw(df_in: pd.DataFrame, mode: str):
+    if mode == "Suivi Imperium":
+        col = find_column(df_in, ["datep", "date"])
+    else:
+        col = find_column(df_in, ["date"])
+    if not col:
+        return None
+    s = pd.to_datetime(df_in[col], errors="coerce").dropna()
+    return s.dt.date.max() if not s.empty else None
+
 # =========================
 # Template loader (2 modes)
 # =========================
@@ -495,7 +506,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                     if pick is not None:
                         used.add(pick.name)
                         r["Code PM"] = pick["Code PM"]
-                        if (not bool(pick.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
+                        if (not bool(p.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
                         else:
                             r["Commentaire"] = None
@@ -615,15 +626,12 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
             return pick, float(pick["diff"])
 
         def insert_minimal_row_yumi(dte, chaine, codepm):
-            # Ligne "Non diffusé" minimale + mois/année remplis
             row = {c: None for c in FINAL_COLUMNS_YUMI}
             dts = pd.to_datetime(dte)
-
             row["Date"] = dts
             row["Chaîne"] = chaine
             row["N° Mois"] = int(dts.month) if not pd.isna(dts) else None
             row["Année"] = int(dts.year) if not pd.isna(dts) else None
-
             row["Code Ecran PM"] = codepm
             row["Commentaire"] = "Non diffusé"
             return row
@@ -756,9 +764,7 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
         dst.protection = pycopy(src.protection)
 
 def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str):
-    # enlever "Cible"
     ws["A6"].value = None
-
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
     ws["B5"].value = ws["H10"].value
@@ -831,15 +837,15 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
         supports = list(df_client["supportp"].dropna().unique())
         get_sub = lambda sup: df_client[df_client["supportp"] == sup].copy()
         sheet_title = lambda sup: safe_sheet_name(f"{client_name} - {str(sup).strip()}")
-        total_col_name = "Code PM"
     else:
         supports = list(df_client["Chaîne"].dropna().unique())
         get_sub = lambda sup: df_client[df_client["Chaîne"] == sup].copy()
         sheet_title = lambda sup: safe_sheet_name(f"{client_name} - {str(sup).strip()}")
-        total_col_name = "Code Ecran PM"
 
     if not supports:
         supports = ["Support"]
+
+    total_col_name = "Code PM" if mode == "Suivi Imperium" else "Code Ecran PM"
 
     for sup in supports:
         ws = wb.copy_worksheet(template_ws)
@@ -885,7 +891,7 @@ except Exception as e:
 
 data_in = st.file_uploader("1) Uploader DATA IMPERIUM" if mode == "Suivi Imperium" else "1) Uploader DATA YUMI", type=["xlsx"])
 pm_file = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"])
-max_date = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
+max_date_ui = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
 
 if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok)):
     if not data_in:
@@ -896,6 +902,11 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
         try:
             with st.spinner("Génération en cours..."):
                 df_in = pd.read_excel(data_in)
+
+                # ✅ bornage par la dernière date réellement présente dans la data brute
+                raw_max = get_max_date_from_raw(df_in, mode)
+                max_date = min(max_date_ui, raw_max) if raw_max is not None else max_date_ui
+                st.info(f"Date max utilisée (bornée par la data brute) : {max_date}")
 
                 if mode == "Suivi Imperium":
                     df_all = build_final_df_from_imperium(df_in, max_date=max_date)
@@ -946,7 +957,7 @@ if st.session_state.client_files:
     st.download_button(
         "📦 Télécharger ZIP",
         data=st.session_state.zip_bytes,
-        file_name=f"Suivis_{mode.replace(' ', '_')}_{max_date.isoformat()}.zip",
+        file_name=f"Suivis_{mode.replace(' ', '_')}_{max_date_ui.isoformat()}.zip",
         mime="application/zip",
         use_container_width=True
     )
