@@ -38,7 +38,7 @@ FINAL_COLUMNS = [
 # =========================
 # UI config
 # =========================
-st.set_page_config(page_title="Suivi Pige — Automatisation", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Suivi Pige — Automatisation (PM 2026 unique)", page_icon="📊", layout="wide")
 
 st.markdown("""
 <style>
@@ -96,12 +96,15 @@ def normalize_brand(name: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+# ✅ NEW: brand key sans espaces (ORBLANC == OR BLANC)
+def brand_key(name: str) -> str:
+    return normalize_brand(name).replace(" ", "")
+
 def normalize_support(sup: str) -> str:
     s = norm_txt(sup)
     s = s.replace(" ", "")
     s = re.sub(r"[^A-Z0-9]+", "", s)
     s = s.replace("TV", "")
-    # uniformiser ALAOULA
     if s in ("AOULA", "ALAOUOLA", "ALAOULA"):
         return "ALAOULA"
     return s
@@ -129,13 +132,11 @@ def to_excel_time(val):
             return None
         return val.to_pydatetime().time()
 
-    # Excel float time
     if isinstance(val, (float, int)):
         seconds = int(round(float(val) * 86400))
         seconds = max(0, min(seconds, 86399))
         return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
 
-    # string
     try:
         s = str(val).strip().replace("h", ":").replace("H", ":")
         t = pd.to_datetime(s, errors="coerce")
@@ -209,15 +210,10 @@ def load_template_workbook() -> openpyxl.Workbook:
 # =========================
 
 def parse_sheet_name(sheet_name: str, known_support_norms: set[str] | None = None):
-    """
-    Split sheet name into (brand, support_display, support_norm).
-    We try last 1..3 tokens as support candidate.
-    """
     tokens = sheet_name.strip().split()
     if not tokens:
         return None, None, None
 
-    # support vocab: from known + common supports
     vocab = set(known_support_norms or set())
     vocab |= {"2M", "MBC5", "ALAOULA"}
 
@@ -232,7 +228,6 @@ def parse_sheet_name(sheet_name: str, known_support_norms: set[str] | None = Non
     if best:
         return best
 
-    # fallback: last token support
     sup = tokens[-1]
     brand = " ".join(tokens[:-1]).strip() or sheet_name
     return brand, sup, normalize_support(sup)
@@ -244,8 +239,9 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
     for sh in wb.sheetnames:
         ws = wb[sh]
         brand, sup_disp, sup_norm = parse_sheet_name(sh, known_support_norms)
+        if not brand:
+            continue
 
-        # expect headers in row 1: Date / Ecran
         for r in range(2, ws.max_row + 1):
             d = ws.cell(r, 1).value
             code = ws.cell(r, 2).value
@@ -255,7 +251,6 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
             if code is None or str(code).strip() == "":
                 continue
 
-            # parse date dayfirst
             d_parsed = pd.to_datetime(d, errors="coerce", dayfirst=True)
             if pd.isna(d_parsed):
                 continue
@@ -266,7 +261,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
 
             recs.append({
                 "PM_FILE_BRAND": brand,
-                "PM_FILE_BRAND_N": normalize_brand(brand),
+                "PM_FILE_BRAND_N": brand_key(brand),   # ✅ key sans espaces
                 "Date": pd.to_datetime(d_date),
                 "date_only": d_date,
                 "supportp": sup_disp,
@@ -276,8 +271,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
                 "PM_TV_MIN": tvm,
             })
 
-    pmv = pd.DataFrame(recs)
-    return pmv
+    return pd.DataFrame(recs)
 
 # =========================
 # Data Imperium -> DF suivi
@@ -301,7 +295,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out["support_norm"] = out["supportp"].apply(normalize_support)
     out["heure de diffusion"] = df[col_time]
     out["Marque"] = df[col_mar].astype(str).str.strip()
-    out["Marque_norm"] = out["Marque"].apply(normalize_brand)
+    out["Marque_norm"] = out["Marque"].apply(brand_key)  # ✅ key sans espaces
 
     out["Message"] = df[find_column(df_imp, ["message", "storyboard"])] if find_column(df_imp, ["message", "storyboard"]) else None
     out["Produit"] = df[find_column(df_imp, ["produit"])] if find_column(df_imp, ["produit"]) else None
@@ -337,7 +331,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
     df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
 
-    # no PM
     if pm_client is None or pm_client.empty:
         base = df.copy()
         for col in FINAL_COLUMNS:
@@ -350,7 +343,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     pm = pm[pm["date_only"] <= max_date]
 
     out_all = []
-    backlog = {}  # par support_norm
+    backlog = {}
 
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm = set(pm["support_norm"].dropna().unique())
@@ -373,14 +366,12 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         dates_pm = set(pm_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real | dates_pm))
 
-        # closest by TV minutes
         def pick_closest(avail, t_real):
             if avail.empty:
                 return None, None
             if t_real is None:
                 pick = avail.iloc[0]
                 return pick, None
-
             rt = real_tv_minutes(t_real)
             tmp = avail.copy()
             tmp["diff"] = tmp["PM_TV_MIN"].apply(lambda pm_m: abs(rt - pm_m) if pm_m is not None else 999999)
@@ -404,13 +395,11 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
             filled_rows = []
             inserted_rows = []
 
-            # 0 réalisé => tout non diffusé
             if real_n == 0 and pm_n > 0:
                 for _, p in pm_day.iterrows():
                     inserted_rows.append(insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé"))
                 backlog[sn] += pm_n
 
-            # equal => chrono
             elif real_n == pm_n:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -425,7 +414,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                         r["Commentaire"] = None
                     filled_rows.append(r)
 
-            # real < pm => closest + non diffusé
             elif real_n < pm_n:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -448,7 +436,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                     inserted_rows.append(insert_minimal_row(d, sup_display, p["Code PM"], "Non diffusé"))
                 backlog[sn] += len(remaining)
 
-            # real > pm => chrono + extras
             else:
                 for i in range(real_n):
                     r = real_day.iloc[i].copy()
@@ -478,7 +465,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 t = to_excel_time(row.get("heure de diffusion"))
                 if t is not None:
                     return real_tv_minutes(t)
-                # non diffusé => tri par Code PM tv minutes
                 _, _, tvm = parse_codepm_time(row.get("Code PM"))
                 return tvm
 
@@ -595,7 +581,7 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
 
                 for client_name in sorted(df_all["Marque"].dropna().unique()):
                     df_client_raw = df_all[df_all["Marque"] == client_name].copy()
-                    client_norm = normalize_brand(client_name)
+                    client_norm = brand_key(client_name)
 
                     pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
                     if pm_client.empty and not pmv_all.empty:
