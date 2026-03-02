@@ -3,6 +3,7 @@ import re
 import zipfile
 import unicodedata
 from datetime import datetime, date, time, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -15,8 +16,10 @@ from openpyxl.styles import PatternFill, Border, Side
 # =========================
 # CONFIG (2 modes)
 # =========================
-TEMPLATE_IMPERIUM_PATH = "TEMPLATE_SUIVI_FINAL.xlsx"
-TEMPLATE_YUMI_PATH = "SUIVI GATO.xlsx"   # <-- ton template YUMI (exemple GATO)
+APP_DIR = Path(__file__).resolve().parent
+
+TEMPLATE_IMPERIUM_PATH = APP_DIR / "TEMPLATE_SUIVI_FINAL.xlsx"
+TEMPLATE_YUMI_PATH = APP_DIR / "SUIVI GATO.xlsx"   # <-- template YUMI (commité sur GitHub)
 
 HEADER_ROW = 9
 DATA_START_ROW = 10
@@ -348,7 +351,6 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
 # Data YUMI -> DF suivi (copie toutes colonnes template)
 # =========================
 def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFrame:
-    # Mapping robuste (au cas où accents/espaces varient)
     col_date   = find_column(df_yumi, ["date"])
     col_chaine = find_column(df_yumi, ["chaine", "chaîne", "support"])
     col_hdeb   = find_column(df_yumi, ["h.debut", "h début", "heure debut", "hdeb", "début"])
@@ -361,7 +363,6 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFr
     df = df[df["__Date__"].dt.date <= max_date]
 
     out = pd.DataFrame()
-    # Copie de TOUTES les colonnes (si absentes => None)
     for col in FINAL_COLUMNS_YUMI:
         if col == "Date":
             out[col] = df["__Date__"]
@@ -370,19 +371,15 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFr
         elif col == "H.Début":
             out[col] = df[col_hdeb]
         else:
-            # essaye de trouver la colonne correspondante (même nom)
             if col in df.columns:
                 out[col] = df[col]
             else:
-                # fallback (quelques variantes fréquentes)
                 fallback = find_column(df, [col])
                 out[col] = df[fallback] if fallback else None
 
-    # Helpers matching (pas écrits dans Excel)
     out["support_norm"] = out["Chaîne"].apply(normalize_support)
     out["Marque_norm"] = out["Marque"].apply(brand_key)
 
-    # champs à remplir par matching
     out["Code Ecran PM"] = None
     out["Commentaire"] = None
 
@@ -575,7 +572,6 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
         for col in FINAL_COLUMNS_YUMI:
             if col not in base.columns:
                 base[col] = None
-        # garder colonnes template uniquement
         return base[FINAL_COLUMNS_YUMI]
 
     pm = pm_client.copy()
@@ -742,11 +738,10 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
             out_all.append(out_day[FINAL_COLUMNS_YUMI])
 
     out_df = pd.concat(out_all, ignore_index=True) if out_all else df.copy()
-    # garder seulement les colonnes template
     return out_df[FINAL_COLUMNS_YUMI]
 
 # =========================
-# Styles (copie style ligne 10 du template)
+# Styles (copie style ligne 10 du template) + Finalize
 # =========================
 def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
     for c in range(1, len(final_cols) + 1):
@@ -761,23 +756,13 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
         dst.protection = pycopy(src.protection)
 
 def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str):
-    """
-    - Enlève A6 ("Cible") si présent
-    - B4 = date du jour
-    - B5 = contenu H10
-    - Ligne Total: A="Total", B=NBVAL(<colonne total> de row10 à last_data)
-      + Bordures + fond gris UNIQUEMENT sur A & B
-      + Vider bordures/valeurs/fill des autres colonnes sur la ligne Total
-    """
     # enlever "Cible"
     ws["A6"].value = None
 
-    # B4/B5
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
     ws["B5"].value = ws["H10"].value
 
-    # dernière ligne data (basée sur A/B + colonne total si possible)
     total_col_idx = 4
     if total_col_name in final_cols:
         total_col_idx = final_cols.index(total_col_name) + 1
@@ -787,11 +772,9 @@ def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str):
         if (ws.cell(r, 1).value not in (None, "")) or (ws.cell(r, 2).value not in (None, "")) or (ws.cell(r, total_col_idx).value not in (None, "")):
             last_data_row = max(r, DATA_START_ROW)
             break
-
     if last_data_row < DATA_START_ROW:
         last_data_row = DATA_START_ROW
 
-    # NBVAL sur la colonne choisie
     count_vals = 0
     for r in range(DATA_START_ROW, last_data_row + 1):
         if ws.cell(r, total_col_idx).value not in (None, ""):
@@ -844,7 +827,6 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
     reset_sheet(template_ws)
 
-    # supports selon mode
     if mode == "Suivi Imperium":
         supports = list(df_client["supportp"].dropna().unique())
         get_sub = lambda sup: df_client[df_client["supportp"] == sup].copy()
@@ -890,9 +872,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 # =========================
 st.title("📊 Suivi Pige — Automatisation (PM 2026 unique)")
 
-# ✅ Choix juste après le titre
 mode = st.radio("Type de suivi", ["Suivi Imperium", "Suivi YUMI"], horizontal=True)
-
 st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Col A=Date | Col B=Ecran")
 
 template_ok = False
@@ -903,8 +883,7 @@ try:
 except Exception as e:
     st.error(f"Template introuvable ❌ : {e}")
 
-label_data = "1) Uploader DATA IMPERIUM" if mode == "Suivi Imperium" else "1) Uploader DATA YUMI"
-data_in = st.file_uploader(label_data, type=["xlsx"])
+data_in = st.file_uploader("1) Uploader DATA IMPERIUM" if mode == "Suivi Imperium" else "1) Uploader DATA YUMI", type=["xlsx"])
 pm_file = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"])
 max_date = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
 
@@ -919,12 +898,10 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                 df_in = pd.read_excel(data_in)
 
                 if mode == "Suivi Imperium":
-                    # ✅ IMPERIUM INTACT
                     df_all = build_final_df_from_imperium(df_in, max_date=max_date)
                     final_cols = FINAL_COLUMNS_IMPERIUM
                     client_col = "Marque"
                 else:
-                    # ✅ YUMI (nouveau pipeline)
                     df_all = build_final_df_from_yumi(df_in, max_date=max_date)
                     final_cols = FINAL_COLUMNS_YUMI
                     client_col = "Marque"
@@ -949,11 +926,9 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                     else:
                         df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, max_date=max_date)
 
-                    # IMPORTANT : ne pas écrire les helpers dans Excel
                     df_client_done = df_client_done.copy()
-                    for helper in ("support_norm", "Marque_norm"):
-                        if helper in df_client_done.columns:
-                            df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
+                    for helper in ("support_norm", "Marque_norm", "date_only", "t_real"):
+                        df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
 
                     template_wb = load_template_workbook(mode)
                     xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, final_cols, mode=mode)
