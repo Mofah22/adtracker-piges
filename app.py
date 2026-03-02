@@ -9,6 +9,9 @@ import streamlit as st
 import openpyxl
 from copy import copy as pycopy
 
+# ✅ AJOUT (pour bordures + gris sur Total)
+from openpyxl.styles import PatternFill, Border, Side
+
 # =========================
 # CONFIG
 # =========================
@@ -505,20 +508,24 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx):
 
 def finalize_sheet(ws, style_row_cells):
     """
+    ✅ Modifs demandées (sans toucher au reste du code) :
     - B4 = date du jour
-    - B5 = "H10"
-    - Ajoute une ligne Total: A="Total", B=NBVAL(D10:Dlast_data)
+    - B5 = contenu de H10 (pas "H10")
+    - Ligne Total: A="Total", B=NBVAL(D10:Dlast_data)
+      + Bordures UNIQUEMENT sur A & B
+      + Fond gris UNIQUEMENT sur A & B
     """
 
-    # B4/B5
+    # B4
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
-    ws["B5"].value = "H10"
+
+    # ✅ B5 = contenu de H10
+    ws["B5"].value = ws["H10"].value
 
     # Déterminer dernière ligne de data (>=10)
     last_data_row = 9
     for r in range(ws.max_row, DATA_START_ROW - 1, -1):
-        # on considère data si au moins A ou B ou D rempli
         if (ws.cell(r, 1).value not in (None, "")) or (ws.cell(r, 2).value not in (None, "")) or (ws.cell(r, 4).value not in (None, "")):
             last_data_row = max(r, DATA_START_ROW)
             break
@@ -534,18 +541,26 @@ def finalize_sheet(ws, style_row_cells):
 
     total_row = last_data_row + 1
 
-    # Insérer la ligne Total (si besoin)
+    # Insérer la ligne Total
     ws.insert_rows(total_row)
     apply_row_style_from_template(style_row_cells, ws, total_row)
 
     ws.cell(total_row, 1).value = "Total"
     ws.cell(total_row, 2).value = count_d
 
-    # Mettre en gras A et B sur Total (sans casser le style)
-    ws.cell(total_row, 1).font = pycopy(ws.cell(total_row, 1).font)
-    ws.cell(total_row, 2).font = pycopy(ws.cell(total_row, 2).font)
-    ws.cell(total_row, 1).font = ws.cell(total_row, 1).font.copy(bold=True)
-    ws.cell(total_row, 2).font = ws.cell(total_row, 2).font.copy(bold=True)
+    # ✅ Bordures + gris UNIQUEMENT sur A et B
+    grey_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+    thin = Side(style="thin", color="000000")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for col in (1, 2):
+        cell = ws.cell(total_row, col)
+        cell.fill = grey_fill
+        cell.border = thin_border
+
+        # garder ton gras existant
+        cell.font = pycopy(cell.font)
+        cell.font = cell.font.copy(bold=True)
 
 # =========================
 # Build workbooks
@@ -579,7 +594,6 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
-        # Écriture data
         for i in range(len(sub)):
             r_idx = DATA_START_ROW + i
             if r_idx > DATA_START_ROW:
@@ -592,7 +606,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
 
-        # ✅ Ajouts demandés (B4/B5 + Total)
+        # ✅ Ajouts demandés
         finalize_sheet(ws, style_row_cells)
 
     wb.remove(template_ws)
