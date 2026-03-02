@@ -487,6 +487,67 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS] if out_all else df[FINAL_COLUMNS]
 
 # =========================
+# ✅ NEW: Finalize sheet (B4/B5 + Total row)
+# =========================
+
+def apply_row_style_from_template(style_row_cells, ws, row_idx):
+    """Copie le style de la ligne DATA_START_ROW (ligne 10) du template vers row_idx."""
+    for c in range(1, len(FINAL_COLUMNS) + 1):
+        src = style_row_cells[c - 1]
+        dst = ws.cell(row_idx, c)
+        dst._style = pycopy(src._style)
+        dst.number_format = src.number_format
+        dst.font = pycopy(src.font)
+        dst.fill = pycopy(src.fill)
+        dst.border = pycopy(src.border)
+        dst.alignment = pycopy(src.alignment)
+        dst.protection = pycopy(src.protection)
+
+def finalize_sheet(ws, style_row_cells):
+    """
+    - B4 = date du jour
+    - B5 = "H10"
+    - Ajoute une ligne Total: A="Total", B=NBVAL(D10:Dlast_data)
+    """
+
+    # B4/B5
+    ws["B4"].value = date.today()
+    ws["B4"].number_format = "dd/mm/yyyy"
+    ws["B5"].value = "H10"
+
+    # Déterminer dernière ligne de data (>=10)
+    last_data_row = 9
+    for r in range(ws.max_row, DATA_START_ROW - 1, -1):
+        # on considère data si au moins A ou B ou D rempli
+        if (ws.cell(r, 1).value not in (None, "")) or (ws.cell(r, 2).value not in (None, "")) or (ws.cell(r, 4).value not in (None, "")):
+            last_data_row = max(r, DATA_START_ROW)
+            break
+
+    if last_data_row < DATA_START_ROW:
+        last_data_row = DATA_START_ROW
+
+    # NBVAL sur D10:Dlast_data_row
+    count_d = 0
+    for r in range(DATA_START_ROW, last_data_row + 1):
+        if ws.cell(r, 4).value not in (None, ""):
+            count_d += 1
+
+    total_row = last_data_row + 1
+
+    # Insérer la ligne Total (si besoin)
+    ws.insert_rows(total_row)
+    apply_row_style_from_template(style_row_cells, ws, total_row)
+
+    ws.cell(total_row, 1).value = "Total"
+    ws.cell(total_row, 2).value = count_d
+
+    # Mettre en gras A et B sur Total (sans casser le style)
+    ws.cell(total_row, 1).font = pycopy(ws.cell(total_row, 1).font)
+    ws.cell(total_row, 2).font = pycopy(ws.cell(total_row, 2).font)
+    ws.cell(total_row, 1).font = ws.cell(total_row, 1).font.copy(bold=True)
+    ws.cell(total_row, 2).font = ws.cell(total_row, 2).font.copy(bold=True)
+
+# =========================
 # Build workbooks
 # =========================
 
@@ -518,26 +579,21 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
+        # Écriture data
         for i in range(len(sub)):
             r_idx = DATA_START_ROW + i
             if r_idx > DATA_START_ROW:
                 ws.insert_rows(r_idx)
-                for c in range(1, len(FINAL_COLUMNS) + 1):
-                    src = style_row_cells[c - 1]
-                    dst = ws.cell(r_idx, c)
-                    dst._style = pycopy(src._style)
-                    dst.number_format = src.number_format
-                    dst.font = pycopy(src.font)
-                    dst.fill = pycopy(src.fill)
-                    dst.border = pycopy(src.border)
-                    dst.alignment = pycopy(src.alignment)
-                    dst.protection = pycopy(src.protection)
+                apply_row_style_from_template(style_row_cells, ws, r_idx)
 
             for c, col in enumerate(FINAL_COLUMNS, start=1):
                 val = sub.iloc[i][col] if col in sub.columns else None
                 if col == "heure de diffusion":
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
+
+        # ✅ Ajouts demandés (B4/B5 + Total)
+        finalize_sheet(ws, style_row_cells)
 
     wb.remove(template_ws)
     bio = io.BytesIO()
