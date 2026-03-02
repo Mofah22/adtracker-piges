@@ -9,6 +9,9 @@ import streamlit as st
 import openpyxl
 from copy import copy as pycopy
 
+# ✅ NEW imports (Total row style)
+from openpyxl.styles import PatternFill, Border, Side
+
 # =========================
 # CONFIG
 # =========================
@@ -96,7 +99,7 @@ def normalize_brand(name: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# ✅ NEW: brand key sans espaces (ORBLANC == OR BLANC)
+# ✅ brand key sans espaces (ORBLANC == OR BLANC)
 def brand_key(name: str) -> str:
     return normalize_brand(name).replace(" ", "")
 
@@ -261,7 +264,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
 
             recs.append({
                 "PM_FILE_BRAND": brand,
-                "PM_FILE_BRAND_N": brand_key(brand),   # ✅ key sans espaces
+                "PM_FILE_BRAND_N": brand_key(brand),
                 "Date": pd.to_datetime(d_date),
                 "date_only": d_date,
                 "supportp": sup_disp,
@@ -295,7 +298,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out["support_norm"] = out["supportp"].apply(normalize_support)
     out["heure de diffusion"] = df[col_time]
     out["Marque"] = df[col_mar].astype(str).str.strip()
-    out["Marque_norm"] = out["Marque"].apply(brand_key)  # ✅ key sans espaces
+    out["Marque_norm"] = out["Marque"].apply(brand_key)
 
     out["Message"] = df[find_column(df_imp, ["message", "storyboard"])] if find_column(df_imp, ["message", "storyboard"]) else None
     out["Produit"] = df[find_column(df_imp, ["produit"])] if find_column(df_imp, ["produit"]) else None
@@ -487,7 +490,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS] if out_all else df[FINAL_COLUMNS]
 
 # =========================
-# ✅ NEW: Finalize sheet (B4/B5 + Total row)
+# ✅ NEW: Style helpers + Finalize sheet
 # =========================
 
 def apply_row_style_from_template(style_row_cells, ws, row_idx):
@@ -506,19 +509,21 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx):
 def finalize_sheet(ws, style_row_cells):
     """
     - B4 = date du jour
-    - B5 = "H10"
+    - B5 = valeur de H10
     - Ajoute une ligne Total: A="Total", B=NBVAL(D10:Dlast_data)
+      + Bordures + fond gris uniquement sur A et B
     """
 
-    # B4/B5
+    # B4 = date du jour
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
-    ws["B5"].value = "H10"
+
+    # B5 = contenu de H10 (valeur)
+    ws["B5"].value = ws["H10"].value
 
     # Déterminer dernière ligne de data (>=10)
     last_data_row = 9
     for r in range(ws.max_row, DATA_START_ROW - 1, -1):
-        # on considère data si au moins A ou B ou D rempli
         if (ws.cell(r, 1).value not in (None, "")) or (ws.cell(r, 2).value not in (None, "")) or (ws.cell(r, 4).value not in (None, "")):
             last_data_row = max(r, DATA_START_ROW)
             break
@@ -526,7 +531,7 @@ def finalize_sheet(ws, style_row_cells):
     if last_data_row < DATA_START_ROW:
         last_data_row = DATA_START_ROW
 
-    # NBVAL sur D10:Dlast_data_row
+    # NBVAL sur D10:Dlast_data_row (Code PM)
     count_d = 0
     for r in range(DATA_START_ROW, last_data_row + 1):
         if ws.cell(r, 4).value not in (None, ""):
@@ -534,18 +539,24 @@ def finalize_sheet(ws, style_row_cells):
 
     total_row = last_data_row + 1
 
-    # Insérer la ligne Total (si besoin)
+    # Insérer la ligne Total + copie style ligne 10
     ws.insert_rows(total_row)
     apply_row_style_from_template(style_row_cells, ws, total_row)
 
+    # Valeurs Total
     ws.cell(total_row, 1).value = "Total"
     ws.cell(total_row, 2).value = count_d
 
-    # Mettre en gras A et B sur Total (sans casser le style)
-    ws.cell(total_row, 1).font = pycopy(ws.cell(total_row, 1).font)
-    ws.cell(total_row, 2).font = pycopy(ws.cell(total_row, 2).font)
-    ws.cell(total_row, 1).font = ws.cell(total_row, 1).font.copy(bold=True)
-    ws.cell(total_row, 2).font = ws.cell(total_row, 2).font.copy(bold=True)
+    # Style Total : A/B uniquement
+    grey_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+    thin = Side(style="thin", color="000000")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for col in (1, 2):
+        cell = ws.cell(total_row, col)
+        cell.fill = grey_fill
+        cell.border = thin_border
+        cell.font = pycopy(cell.font).copy(bold=True)
 
 # =========================
 # Build workbooks
@@ -579,7 +590,6 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
-        # Écriture data
         for i in range(len(sub)):
             r_idx = DATA_START_ROW + i
             if r_idx > DATA_START_ROW:
@@ -592,7 +602,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
                     val = to_excel_time(val)
                 ws.cell(r_idx, c).value = val
 
-        # ✅ Ajouts demandés (B4/B5 + Total)
+        # ✅ Ajouts demandés
         finalize_sheet(ws, style_row_cells)
 
     wb.remove(template_ws)
