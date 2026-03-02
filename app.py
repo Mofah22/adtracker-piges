@@ -425,7 +425,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                     if pick is not None:
                         used.add(pick.name)
                         r["Code PM"] = pick["Code PM"]
-                        if (not bool(pick.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
+                        if (not bool(p.get("Overnight", False))) and diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
                         else:
                             r["Commentaire"] = None
@@ -509,12 +509,20 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx):
 def finalize_sheet(ws, style_row_cells):
     """
     ✅ Modifs demandées (sans toucher au reste du code) :
+    - Enlever le mot "cible" de A6
     - B4 = date du jour
     - B5 = contenu de H10 (pas "H10")
     - Ligne Total: A="Total", B=NBVAL(D10:Dlast_data)
       + Bordures UNIQUEMENT sur A & B
       + Fond gris UNIQUEMENT sur A & B
+      + Pas de bordures / pas de style "Total" sur C..N (ligne Total = seulement A et B)
     """
+
+    # ✅ Enlever le mot "cible" de A6 (sans casser le reste du texte)
+    a6 = ws["A6"].value
+    if isinstance(a6, str) and a6.strip():
+        cleaned = re.sub(r"(?i)\bCIBLE\b\s*:?\s*", "", a6).strip()
+        ws["A6"].value = cleaned if cleaned != "" else None
 
     # B4
     ws["B4"].value = date.today()
@@ -541,12 +549,22 @@ def finalize_sheet(ws, style_row_cells):
 
     total_row = last_data_row + 1
 
-    # Insérer la ligne Total
+    # Insérer la ligne Total (on copie le style template puis on "nettoie" C..N)
     ws.insert_rows(total_row)
     apply_row_style_from_template(style_row_cells, ws, total_row)
 
+    # Valeurs A/B
     ws.cell(total_row, 1).value = "Total"
     ws.cell(total_row, 2).value = count_d
+
+    # ✅ Nettoyer les autres colonnes de la ligne Total (C..N) : vides + sans bordures
+    empty_border = Border()  # pas de bordure
+    empty_fill = PatternFill()  # pas de remplissage
+    for col in range(3, len(FINAL_COLUMNS) + 1):
+        cell = ws.cell(total_row, col)
+        cell.value = None
+        cell.border = empty_border
+        cell.fill = empty_fill
 
     # ✅ Bordures + gris UNIQUEMENT sur A et B
     grey_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
@@ -557,8 +575,6 @@ def finalize_sheet(ws, style_row_cells):
         cell = ws.cell(total_row, col)
         cell.fill = grey_fill
         cell.border = thin_border
-
-        # garder ton gras existant
         cell.font = pycopy(cell.font)
         cell.font = cell.font.copy(bold=True)
 
@@ -594,6 +610,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
 
         sub = df_client[df_client["supportp"] == sup].copy()
 
+        # Écriture data
         for i in range(len(sub)):
             r_idx = DATA_START_ROW + i
             if r_idx > DATA_START_ROW:
