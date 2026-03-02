@@ -10,6 +10,7 @@ import streamlit as st
 import openpyxl
 from copy import copy as pycopy
 
+# ✅ Bordures + gris sur Total
 from openpyxl.styles import PatternFill, Border, Side
 
 # =========================
@@ -22,8 +23,15 @@ TEMPLATE_YUMI_PATH = APP_DIR / "SUIVI GATO.xlsx"
 
 HEADER_ROW = 9
 DATA_START_ROW = 10
+
 DECALAGE_MINUTES = 45
-TV_DAY_CUTOFF_HOUR = 6  # 00:00-05:59 => fin journée TV => +1440
+TV_DAY_CUTOFF_HOUR = 6
+
+# Swap rules (ordre + swap intelligent)
+SWAP_NEAR_MINUTES = 5        # PM2 quasi identique
+SWAP_PM1_FAR_MINUTES = 20    # PM1 trop loin
+ANTI_VOL_NEXT_MAX = 20       # protéger PM2 pour la diffusion suivante seulement si elle peut en profiter
+LOOKAHEAD_STEPS = 1          # on ne regarde que la diffusion suivante
 
 FINAL_COLUMNS_IMPERIUM = [
     "datep",
@@ -175,26 +183,27 @@ def to_excel_time(val):
     except:
         return None
 
+def _digits_hhmm(code: str):
+    if code is None:
+        return None
+    s = str(code).strip().upper()
+    m = re.match(r"(\d{3,4})", s)
+    return m.group(1) if m else None
+
 def parse_codepm_time(code_pm: str):
     """
+    Ignore suffix letters: 1600R == 1600A == 1600
     Retourne: (match_time, overnight_bool, tv_minutes)
-    tv_minutes garde hh>=24 => 2500R -> 1500
+    tv_minutes garde hh>=24 => 2500 -> 1500
     """
-    if code_pm is None:
+    hhmm = _digits_hhmm(code_pm)
+    if not hhmm:
         return None, False, None
 
-    s = str(code_pm).strip().upper()
-    m = re.match(r"(\d{3,4})", s)
-    if not m:
-        return None, False, None
-
-    hhmm = m.group(1)
     if len(hhmm) == 3:
-        hh = int(hhmm[0])
-        mm = int(hhmm[1:])
+        hh = int(hhmm[0]); mm = int(hhmm[1:])
     else:
-        hh = int(hhmm[:2])
-        mm = int(hhmm[2:])
+        hh = int(hhmm[:2]); mm = int(hhmm[2:])
 
     if mm < 0 or mm > 59:
         return None, False, None
@@ -227,76 +236,55 @@ def find_column(df: pd.DataFrame, candidates: list[str]):
                 return c
     return None
 
-def get_max_date_from_raw(df_in: pd.DataFrame, mode: str):
+def get_min_max_date_from_raw(df_in: pd.DataFrame, mode: str):
     col = find_column(df_in, ["datep", "date"]) if mode == "Suivi Imperium" else find_column(df_in, ["date"])
     if not col:
-        return None
+        return None, None
     s = pd.to_datetime(df_in[col], errors="coerce").dropna()
-    return s.dt.date.max() if not s.empty else None
+    if s.empty:
+        return None, None
+    return s.dt.date.min(), s.dt.date.max()
+
+def pm_tv_min_safe(code_pm, fallback):
+    try:
+        if fallback is not None and pd.notna(fallback):
+            return int(fallback)
+    except:
+        pass
+    _, _, tvm = parse_codepm_time(code_pm)
+    return tvm if tvm is not None else 10**9
 
 # =========================
-# ✅ Matching DP (plus proche + préférence "avant" + tie "plus tôt")
+# Swap decision (ordre + anti-vol)
 # =========================
-def ordered_min_cost_match(rt_list, pm_list):
+def should_swap(rt_i, pm_i, pm_j, rt_next=None, pm1_far=SWAP_PM1_FAR_MINUTES, near=SWAP_NEAR_MINUTES, anti_next_max=ANTI_VOL_NEXT_MAX):
     """
-    Matching monotone optimal.
-    Priorité:
-      1) plus proche (min |diff|)
-      2) préfère PM <= réel (avant) si possible
-      3) à égalité, préfère PM plus tôt
+    Decide if Ri should take PM2 instead of PM1 (swap between consecutive PMs).
+    Conditions:
+      - d2 <= near AND d1 > pm1_far
+      - and NOT anti-vol if next diffusion exists and needs PM2 (within anti_next_max)
     """
-    def cost(rt, pm):
-        if rt is None or pm is None:
-            return 10**18
-        diff = abs(rt - pm)
-        # pénalité énorme si PM après réel
-        after_pen = 10**9 if pm > rt else 0
-        # tie-break: plus tôt => pm plus petit => coût plus petit
-        # diff domine largement grâce au *10000
-        return diff * 10000 + after_pen + pm
+    if rt_i is None:
+        return False
 
-    n = len(rt_list)
-    m = len(pm_list)
-    if n == 0 or m == 0:
-        return []
+    d1 = abs(rt_i - pm_i) if pm_i < 10**9 else 10**9
+    d2 = abs(rt_i - pm_j) if pm_j < 10**9 else 10**9
 
-    # n <= m : on affecte chaque réel à un PM (on peut skipper des PM)
-    if n <= m:
-        INF = 10**18
-        dp = [[INF] * (m + 1) for _ in range(n + 1)]
-        take = [[False] * (m + 1) for _ in range(n + 1)]
+    if not (d2 <= near and d1 > pm1_far):
+        return False
 
-        for j in range(m + 1):
-            dp[0][j] = 0
+    # anti-vol with next diffusion (lookahead 1)
+    if rt_next is None:
+        return True
 
-        for i in range(1, n + 1):
-            for j in range(1, m + 1):
-                # skip pm
-                dp[i][j] = dp[i][j - 1]
-                take[i][j] = False
+    e1 = abs(rt_next - pm_i) if pm_i < 10**9 else 10**9
+    e2 = abs(rt_next - pm_j) if pm_j < 10**9 else 10**9
 
-                # take pm
-                v = dp[i - 1][j - 1] + cost(rt_list[i - 1], pm_list[j - 1])
-                if v < dp[i][j]:
-                    dp[i][j] = v
-                    take[i][j] = True
+    # only protect if next can really benefit from PM2
+    if e2 <= anti_next_max and e2 < e1 and e1 > d1:
+        return False
 
-        pairs = []
-        i, j = n, m
-        while i > 0 and j > 0:
-            if take[i][j]:
-                pairs.append((i - 1, j - 1))
-                i -= 1
-                j -= 1
-            else:
-                j -= 1
-        pairs.reverse()
-        return pairs
-
-    # n > m : on affecte chaque PM à un réel (on peut skipper des réels)
-    else:
-        pairs_pm_to_real = ordered_min_cost_match(pm_list, rt_list)  # (i_pm, j_real)
-        return [(j_real, i_pm) for (i_pm, j_real) in pairs_pm_to_real]
+    return True
 
 # =========================
 # Template loader
@@ -344,6 +332,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
         for r in range(2, ws.max_row + 1):
             d = ws.cell(r, 1).value
             code = ws.cell(r, 2).value
+
             if d is None and code is None:
                 continue
             if code is None or str(code).strip() == "":
@@ -368,12 +357,13 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
                 "Overnight": overnight,
                 "PM_TV_MIN": tvm,
             })
+
     return pd.DataFrame(recs)
 
 # =========================
 # DATA builders
 # =========================
-def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.DataFrame:
+def build_final_df_from_imperium(df_imp: pd.DataFrame, date_min: date, date_max: date) -> pd.DataFrame:
     col_date = find_column(df_imp, ["datep", "date"])
     col_sup  = find_column(df_imp, ["supportp", "support", "chaine", "station"])
     col_time = find_column(df_imp, ["heurep", "heure"])
@@ -383,7 +373,8 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
 
     df = df_imp.copy()
     df["datep"] = pd.to_datetime(df[col_date], errors="coerce")
-    df = df[df["datep"].dt.date <= max_date]
+    df = df[df["datep"].dt.date >= date_min]
+    df = df[df["datep"].dt.date <= date_max]
 
     out = pd.DataFrame()
     out["datep"] = df["datep"]
@@ -406,7 +397,7 @@ def build_final_df_from_imperium(df_imp: pd.DataFrame, max_date: date) -> pd.Dat
     out["Commentaire"] = None
     return out
 
-def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFrame:
+def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: date) -> pd.DataFrame:
     col_date   = find_column(df_yumi, ["date"])
     col_chaine = find_column(df_yumi, ["chaine", "chaîne", "support"])
     col_hdeb   = find_column(df_yumi, ["h.debut", "h début", "heure debut", "hdeb", "début"])
@@ -416,7 +407,8 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFr
 
     df = df_yumi.copy()
     df["__Date__"] = pd.to_datetime(df[col_date], errors="coerce")
-    df = df[df["__Date__"].dt.date <= max_date]
+    df = df[df["__Date__"].dt.date >= date_min]
+    df = df[df["__Date__"].dt.date <= date_max]
 
     out = pd.DataFrame()
     for col in FINAL_COLUMNS_YUMI:
@@ -440,21 +432,49 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, max_date: date) -> pd.DataFr
     return out
 
 # =========================
-# Helpers PM safe minutes
+# Matching engine (ordre + swap intelligent)
 # =========================
-def pm_tv_min_safe(code_pm, fallback):
-    try:
-        if fallback is not None and pd.notna(fallback):
-            return int(fallback)
-    except:
-        pass
-    _, _, tvm = parse_codepm_time(code_pm)
-    return tvm if tvm is not None else 10**9
+def match_day_order_with_swaps(rt_minutes, pm_minutes):
+    """
+    Return assignment list of length len(rt_minutes):
+      assign[i] = j index in pm_minutes or None
+    Uses order pairing, with possible swaps between consecutive PMs using should_swap.
+    """
+    n = len(rt_minutes)
+    m = len(pm_minutes)
+
+    # base: order
+    assign = [None] * n
+    k = min(n, m)
+    for i in range(k):
+        assign[i] = i
+
+    # swap pass (single pass is enough with lookahead 1 in practice)
+    # We operate only where both pm i and pm i+1 exist and both real i and real i+1 exist.
+    for i in range(min(k - 1, n - 1)):
+        j1 = assign[i]
+        j2 = assign[i + 1]
+        if j1 is None or j2 is None:
+            continue
+        if j2 != j1 + 1:
+            continue  # must be consecutive
+
+        rt_i = rt_minutes[i]
+        rt_next = rt_minutes[i + 1] if (i + 1) < n else None
+
+        pm1 = pm_minutes[j1]
+        pm2 = pm_minutes[j2]
+
+        if should_swap(rt_i, pm1, pm2, rt_next=rt_next):
+            # swap assignments for i and i+1
+            assign[i], assign[i + 1] = assign[i + 1], assign[i]
+
+    return assign
 
 # =========================
-# Matching IMPERIUM (DP + Anticipé)
+# Fill IMPERIUM per client (no anticipé)
 # =========================
-def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, max_date: date):
+def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
     df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
@@ -468,10 +488,10 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
     pm = pm_client.copy()
     pm = pm[pm["date_only"].notna()]
-    pm = pm[pm["date_only"] <= max_date]
+    pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
 
     out_all = []
-    backlog = {}
+    backlog_by_support = {}
 
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm = set(pm["support_norm"].dropna().unique())
@@ -486,7 +506,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         return row
 
     for sn in all_supports:
-        backlog.setdefault(sn, 0)
+        backlog_by_support.setdefault(sn, 0)
 
         real_s = df[df["support_norm"] == sn].copy()
         pm_s = pm[pm["support_norm"] == sn].copy()
@@ -502,44 +522,39 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         dates_pm = set(pm_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real | dates_pm))
 
-        pm_by_date = {d: pm_s[pm_s["date_only"] == d].copy() for d in all_dates}
-
         for d in all_dates:
-            if d > max_date:
+            if d < date_min or d > date_max:
                 continue
 
             real_day = real_s[real_s["date_only"] == d].copy()
             real_day["_rt"] = real_day["t_real"].apply(lambda t: real_tv_minutes(t))
             real_day = real_day.sort_values("_rt", na_position="last").drop(columns=["_rt"], errors="ignore")
 
-            pm_day = pm_by_date.get(d, pd.DataFrame()).copy()
+            pm_day = pm_s[pm_s["date_only"] == d].copy()
             if not pm_day.empty:
                 pm_day["_PM_TV_MIN_SAFE"] = pm_day.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
                 pm_day = pm_day.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
 
-            real_n = len(real_day)
-            pm_n = len(pm_day)
+            rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
+            pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
 
             filled_rows = []
             inserted_rows = []
 
-            if real_n == 0 and pm_n > 0:
-                for _, pm_row in pm_day.iterrows():
-                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_row["Code PM"]))
-                backlog[sn] += pm_n
+            if len(real_day) == 0 and len(pm_day) > 0:
+                for _, p in pm_day.iterrows():
+                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, p["Code PM"]))
+                backlog_by_support[sn] += len(pm_day)
             else:
-                rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
-                pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(pm_n)]
+                assign = match_day_order_with_swaps(rt_minutes, pm_minutes)
 
-                pairs = ordered_min_cost_match(rt_minutes, pm_minutes)
-                pair_map = {i: j for (i, j) in pairs}
-                used_pm_idx = set(j for _, j in pairs)
+                used_pm = set(j for j in assign if j is not None)
 
-                # affectations
-                for i in range(real_n):
+                # fill real rows
+                for i in range(len(real_day)):
                     r = real_day.iloc[i].copy()
-                    if i in pair_map:
-                        j = pair_map[i]
+                    j = assign[i] if i < len(assign) else None
+                    if j is not None and j < len(pm_day):
                         pm_row = pm_day.iloc[j]
                         r["Code PM"] = pm_row["Code PM"]
 
@@ -549,45 +564,25 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                             if pm_min < 10**9:
                                 diff = abs(rt_minutes[i] - pm_min)
 
-                        overnight_flag = bool(pm_row.get("Overnight", False))
-                        if (not overnight_flag) and diff is not None and diff > DECALAGE_MINUTES:
+                        if diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
                         else:
                             r["Commentaire"] = None
                     else:
+                        # extra diffusion
                         r["Code PM"] = None
-                        r["Commentaire"] = None
-                    filled_rows.append(r)
-
-                # PM restants => Non diffusé
-                for j in range(pm_n):
-                    if j in used_pm_idx:
-                        continue
-                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"]))
-                backlog[sn] += (pm_n - len(used_pm_idx))
-
-                # extras réels => Anticipé (D+1) sinon comp/sup
-                next_d = d + timedelta(days=1)
-                pm_next = pm_by_date.get(next_d, pd.DataFrame()).copy()
-                if not pm_next.empty:
-                    pm_next["_PM_TV_MIN_SAFE"] = pm_next.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
-                    pm_next = pm_next.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
-
-                for r in filled_rows:
-                    if r.get("Code PM") is not None:
-                        continue
-                    if pm_next is not None and not pm_next.empty:
-                        first = pm_next.iloc[0]
-                        pm_next = pm_next.drop(index=first.name, errors="ignore")
-                        r["Code PM"] = first["Code PM"]
-                        r["Commentaire"] = "Anticipé"
-                        pm_by_date[next_d] = pm_next.copy()
-                    else:
-                        if backlog[sn] > 0:
+                        if backlog_by_support[sn] > 0:
                             r["Commentaire"] = "Compensation"
-                            backlog[sn] -= 1
+                            backlog_by_support[sn] -= 1
                         else:
                             r["Commentaire"] = "Passage supplémentaire"
+                    filled_rows.append(r)
+
+                # remaining pm => non diffusé
+                remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
+                for j in remaining_pm:
+                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"]))
+                backlog_by_support[sn] += len(remaining_pm)
 
             df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame()
             df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
@@ -606,7 +601,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 df_insert["_sort_t"] = df_insert.apply(lambda rr: sort_key_tv(rr), axis=1)
 
             out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
-                if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
+                     if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
 
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
             out_all.append(out_day[FINAL_COLUMNS_IMPERIUM])
@@ -614,9 +609,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     return pd.concat(out_all, ignore_index=True)[FINAL_COLUMNS_IMPERIUM] if out_all else df[FINAL_COLUMNS_IMPERIUM]
 
 # =========================
-# Matching YUMI (DP + Anticipé)
+# Fill YUMI per client (no anticipé)
 # =========================
-def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, max_date: date):
+def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
     df["date_only"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
     df["t_real"] = df["H.Début"].apply(to_excel_time)
@@ -630,10 +625,10 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
 
     pm = pm_client.copy()
     pm = pm[pm["date_only"].notna()]
-    pm = pm[pm["date_only"] <= max_date]
+    pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
 
     out_all = []
-    backlog = {}
+    backlog_by_support = {}
 
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm = set(pm["support_norm"].dropna().unique())
@@ -651,7 +646,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
         return row
 
     for sn in all_supports:
-        backlog.setdefault(sn, 0)
+        backlog_by_support.setdefault(sn, 0)
 
         real_s = df[df["support_norm"] == sn].copy()
         pm_s = pm[pm["support_norm"] == sn].copy()
@@ -667,44 +662,37 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
         dates_pm = set(pm_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real | dates_pm))
 
-        pm_by_date = {d: pm_s[pm_s["date_only"] == d].copy() for d in all_dates}
-
         for d in all_dates:
-            if d > max_date:
+            if d < date_min or d > date_max:
                 continue
 
             real_day = real_s[real_s["date_only"] == d].copy()
             real_day["_rt"] = real_day["t_real"].apply(lambda t: real_tv_minutes(t))
             real_day = real_day.sort_values("_rt", na_position="last").drop(columns=["_rt"], errors="ignore")
 
-            pm_day = pm_by_date.get(d, pd.DataFrame()).copy()
+            pm_day = pm_s[pm_s["date_only"] == d].copy()
             if not pm_day.empty:
                 pm_day["_PM_TV_MIN_SAFE"] = pm_day.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
                 pm_day = pm_day.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
 
-            real_n = len(real_day)
-            pm_n = len(pm_day)
+            rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
+            pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
 
             filled_rows = []
             inserted_rows = []
 
-            if real_n == 0 and pm_n > 0:
-                for _, pm_row in pm_day.iterrows():
-                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, pm_row["Code PM"]))
-                backlog[sn] += pm_n
+            if len(real_day) == 0 and len(pm_day) > 0:
+                for _, p in pm_day.iterrows():
+                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, p["Code PM"]))
+                backlog_by_support[sn] += len(pm_day)
             else:
-                rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
-                pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(pm_n)]
+                assign = match_day_order_with_swaps(rt_minutes, pm_minutes)
+                used_pm = set(j for j in assign if j is not None)
 
-                pairs = ordered_min_cost_match(rt_minutes, pm_minutes)
-                pair_map = {i: j for (i, j) in pairs}
-                used_pm_idx = set(j for _, j in pairs)
-
-                # affectations
-                for i in range(real_n):
+                for i in range(len(real_day)):
                     r = real_day.iloc[i].copy()
-                    if i in pair_map:
-                        j = pair_map[i]
+                    j = assign[i] if i < len(assign) else None
+                    if j is not None and j < len(pm_day):
                         pm_row = pm_day.iloc[j]
                         r["Code Ecran PM"] = pm_row["Code PM"]
 
@@ -714,45 +702,23 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                             if pm_min < 10**9:
                                 diff = abs(rt_minutes[i] - pm_min)
 
-                        overnight_flag = bool(pm_row.get("Overnight", False))
-                        if (not overnight_flag) and diff is not None and diff > DECALAGE_MINUTES:
+                        if diff is not None and diff > DECALAGE_MINUTES:
                             r["Commentaire"] = "Décalage"
                         else:
                             r["Commentaire"] = None
                     else:
                         r["Code Ecran PM"] = None
-                        r["Commentaire"] = None
-                    filled_rows.append(r)
-
-                # PM restants => Non diffusé
-                for j in range(pm_n):
-                    if j in used_pm_idx:
-                        continue
-                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, pm_day.iloc[j]["Code PM"]))
-                backlog[sn] += (pm_n - len(used_pm_idx))
-
-                # extras réels => Anticipé (D+1) sinon comp/sup
-                next_d = d + timedelta(days=1)
-                pm_next = pm_by_date.get(next_d, pd.DataFrame()).copy()
-                if not pm_next.empty:
-                    pm_next["_PM_TV_MIN_SAFE"] = pm_next.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
-                    pm_next = pm_next.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
-
-                for r in filled_rows:
-                    if r.get("Code Ecran PM") is not None:
-                        continue
-                    if pm_next is not None and not pm_next.empty:
-                        first = pm_next.iloc[0]
-                        pm_next = pm_next.drop(index=first.name, errors="ignore")
-                        r["Code Ecran PM"] = first["Code PM"]
-                        r["Commentaire"] = "Anticipé"
-                        pm_by_date[next_d] = pm_next.copy()
-                    else:
-                        if backlog[sn] > 0:
+                        if backlog_by_support[sn] > 0:
                             r["Commentaire"] = "Compensation"
-                            backlog[sn] -= 1
+                            backlog_by_support[sn] -= 1
                         else:
                             r["Commentaire"] = "Passage supplémentaire"
+                    filled_rows.append(r)
+
+                remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
+                for j in remaining_pm:
+                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, pm_day.iloc[j]["Code PM"]))
+                backlog_by_support[sn] += len(remaining_pm)
 
             df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame()
             df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
@@ -771,7 +737,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                 df_insert["_sort_t"] = df_insert.apply(lambda rr: sort_key_tv_yumi(rr), axis=1)
 
             out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
-                if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
+                     if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
 
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
             out_all.append(out_day[FINAL_COLUMNS_YUMI])
@@ -931,16 +897,21 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
             with st.spinner("Génération en cours..."):
                 df_in = pd.read_excel(data_in)
 
-                raw_max = get_max_date_from_raw(df_in, mode)
-                max_date = min(max_date_ui, raw_max) if raw_max is not None else max_date_ui
-                st.info(f"Date max utilisée (bornée par la data brute) : {max_date}")
+                min_raw, max_raw = get_min_max_date_from_raw(df_in, mode)
+                if min_raw is None or max_raw is None:
+                    raise ValueError("Impossible de détecter min/max date dans la data brute.")
+
+                date_min = min_raw
+                date_max = min(max_date_ui, max_raw)
+
+                st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
 
                 if mode == "Suivi Imperium":
-                    df_all = build_final_df_from_imperium(df_in, max_date=max_date)
+                    df_all = build_final_df_from_imperium(df_in, date_min=date_min, date_max=date_max)
                     final_cols = FINAL_COLUMNS_IMPERIUM
                     client_col = "Marque"
                 else:
-                    df_all = build_final_df_from_yumi(df_in, max_date=max_date)
+                    df_all = build_final_df_from_yumi(df_in, date_min=date_min, date_max=date_max)
                     final_cols = FINAL_COLUMNS_YUMI
                     client_col = "Marque"
 
@@ -959,9 +930,9 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                         ].copy()
 
                     if mode == "Suivi Imperium":
-                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, max_date=max_date)
+                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
                     else:
-                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, max_date=max_date)
+                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
 
                     df_client_done = df_client_done.copy()
                     for helper in ("support_norm", "Marque_norm", "date_only", "t_real"):
