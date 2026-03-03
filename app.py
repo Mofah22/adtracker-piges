@@ -162,16 +162,13 @@ def find_column(df: pd.DataFrame, candidates: list[str]):
 def extract_first_time_from_text(val):
     """
     Ex: '21:12 | 21:22' -> time(21,12)
-    Ex: '24:15' -> time(0,15) (on gère la journée TV via real_tv_minutes)
     """
     if val is None:
         return None
     s = str(val)
-
     found = re.findall(r"(\d{1,2})\s*[:hH]\s*(\d{2})", s)
     if not found:
         return None
-
     times = []
     for hh, mm in found:
         hh_i = int(hh)
@@ -180,7 +177,7 @@ def extract_first_time_from_text(val):
             times.append((hh_i, mm_i))
     if not times:
         return None
-    hh_i, mm_i = min(times)
+    hh_i, mm_i = min(times)  # plus tôt
     return time(hh_i % 24, mm_i, 0)
 
 def to_excel_time(val):
@@ -206,8 +203,8 @@ def to_excel_time(val):
         seconds = max(0, min(seconds, 86399))
         return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
 
-    # ✅ string qui contient plusieurs heures
     if isinstance(val, str):
+        # ✅ cas '21:12 | 21:22'
         t0 = extract_first_time_from_text(val)
         if t0 is not None:
             return t0
@@ -221,23 +218,19 @@ def to_excel_time(val):
     except:
         return None
 
-def _digits_hhmm(code: str):
-    if code is None:
-        return None
-    s = str(code).strip().upper()
-    m = re.match(r"(\d{3,4})", s)
-    return m.group(1) if m else None
-
 def code_hhmm_digits(x):
     """
     Convertit '24-15', '24:15', '2415R', '24h15' -> '2415'
+    Ignore suffix letters.
     """
     if x is None:
         return None
     s = str(x).strip().upper().replace("H", ":")
-    m = re.match(r"(\d{3,4})", s)
+    # 3/4 digits anywhere
+    m = re.search(r"(\d{3,4})", s)
     if m:
         return m.group(1)
+    # hh[:|-]mm
     m2 = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{2})", s)
     if m2:
         hh = int(m2.group(1))
@@ -247,11 +240,11 @@ def code_hhmm_digits(x):
 
 def parse_codepm_time(code_pm: str):
     """
-    Ignore suffix letters: 1600R == 1600A == 1600
-    Retourne: (match_time, overnight_bool, tv_minutes)
-    tv_minutes garde hh>=24 => 2500 -> 1500
+    Supporte: 1600R / 1600A / 16:00 / 16-00 / 24-15 etc.
+    Retourne: (match_time, overnight_bool, tv_minutes_raw)
+    tv_minutes_raw = hh*60+mm (hh peut être >=24)
     """
-    hhmm = _digits_hhmm(code_pm)
+    hhmm = code_hhmm_digits(code_pm)
     if not hhmm:
         return None, False, None
 
@@ -276,6 +269,33 @@ def real_tv_minutes(t: time, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
         m += 1440
     return m
 
+def pm_tv_minutes_tvday(code_pm: str, fallback=None, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
+    """
+    Minutes TV-DAY pour PM:
+    - si hh < cutoff (et hh < 24) => +1440 (fin de journée)
+    - si hh >= 24 => garde tel quel
+    """
+    # 1) fallback numeric?
+    try:
+        if fallback is not None and pd.notna(fallback):
+            tvm = int(fallback)
+        else:
+            tvm = None
+    except:
+        tvm = None
+
+    if tvm is None:
+        _, _, tvm = parse_codepm_time(code_pm)
+
+    if tvm is None:
+        return 10**9
+
+    # retrouver hh à partir de tvm (sans perdre hh>=24)
+    hh = tvm // 60
+    if hh < 24 and hh < cutoff_hour:
+        tvm += 1440
+    return tvm
+
 def make_zip(files: dict[str, bytes]) -> bytes:
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
@@ -291,15 +311,6 @@ def get_min_max_date_from_raw(df_in: pd.DataFrame, mode: str):
     if s.empty:
         return None, None
     return s.dt.date.min(), s.dt.date.max()
-
-def pm_tv_min_safe(code_pm, fallback):
-    try:
-        if fallback is not None and pd.notna(fallback):
-            return int(fallback)
-    except:
-        pass
-    _, _, tvm = parse_codepm_time(code_pm)
-    return tvm if tvm is not None else 10**9
 
 # =========================
 # Swap decision (ordre + anti-vol)
@@ -336,12 +347,9 @@ def should_swap(rt_i, pm_i, pm_j, rt_next=None):
 # =========================
 def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes):
     """
-    real_codes: list[str|None] digits 'HHMM' de la ligne réelle (si dispo)
-    pm_codes:   list[str|None] digits 'HHMM' de la ligne PM
-
     Étape 0: verrouiller les matchs EXACT (code écran == code PM) sans voler.
     Étape 1: remplir le reste par ordre.
-    Étape 2: appliquer swap intelligent (sur les paires consécutives) avec anti-vol.
+    Étape 2: appliquer swap intelligent (sur paires consécutives) avec anti-vol.
     Return: assign list len(rt_minutes): assign[i] = j index in pm list or None
     """
     n = len(rt_minutes)
@@ -373,16 +381,14 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
         assign[remaining_real[idx]] = remaining_pm[idx]
         used_pm.add(remaining_pm[idx])
 
-    # 2) swap pass (lookahead 1) uniquement sur indices consécutifs en ordre réel
-    # on parcourt toutes les paires i, i+1
+    # 2) swap pass (lookahead 1) sur paires consécutives d'indices PM
     for i in range(n - 1):
         j1 = assign[i]
         j2 = assign[i + 1]
         if j1 is None or j2 is None:
             continue
-        # swap seulement si j2 est le suivant direct de j1 (logique ordre)
         if j2 != j1 + 1:
-            continue
+            continue  # uniquement consécutifs
 
         rt_i = rt_minutes[i]
         rt_next = rt_minutes[i + 1]
@@ -449,7 +455,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
             d_date = d_parsed.date()
 
             codepm = str(code).strip()
-            _, overnight, tvm = parse_codepm_time(codepm)
+            _, overnight, tvm_raw = parse_codepm_time(codepm)
 
             recs.append({
                 "PM_FILE_BRAND": brand,
@@ -460,7 +466,7 @@ def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set[str]) -> pd.
                 "support_norm": sup_norm,
                 "Code PM": codepm,
                 "Overnight": overnight,
-                "PM_TV_MIN": tvm,
+                "PM_TV_MIN": tvm_raw,  # raw minutes, tv-day handled later
             })
 
     return pd.DataFrame(recs)
@@ -544,12 +550,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
     df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
 
-    # essayer de trouver un "code écran réel" si existant dans le brut (sinon None)
+    # exact codes if available
     col_real_code = find_column(df, ["code ecran", "code écran", "ecran", "écran"])
-    if col_real_code:
-        df["_real_code_digits"] = df[col_real_code].apply(code_hhmm_digits)
-    else:
-        df["_real_code_digits"] = None
+    df["_real_code_digits"] = df[col_real_code].apply(code_hhmm_digits) if col_real_code else None
 
     if pm_client is None or pm_client.empty:
         base = df.copy()
@@ -584,12 +587,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         real_s = df[df["support_norm"] == sn].copy()
         pm_s = pm[pm["support_norm"] == sn].copy()
 
-        if not real_s.empty:
-            sup_display = str(real_s.iloc[0]["supportp"])
-        elif not pm_s.empty:
-            sup_display = str(pm_s.iloc[0]["supportp"])
-        else:
-            sup_display = str(sn)
+        sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else (str(pm_s.iloc[0]["supportp"]) if not pm_s.empty else str(sn))
 
         dates_real = set(real_s["date_only"].dropna().unique())
         dates_pm = set(pm_s["date_only"].dropna().unique())
@@ -605,13 +603,12 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
             pm_day = pm_s[pm_s["date_only"] == d].copy()
             if not pm_day.empty:
-                pm_day["_PM_TV_MIN_SAFE"] = pm_day.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
-                pm_day = pm_day.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
+                pm_day["_PM_TV_MIN_TVDAY"] = pm_day.apply(lambda r: pm_tv_minutes_tvday(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
+                pm_day = pm_day.sort_values("_PM_TV_MIN_TVDAY", na_position="last").drop(columns=["_PM_TV_MIN_TVDAY"], errors="ignore")
 
             rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
-            pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
+            pm_minutes = [pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
 
-            # exact codes
             real_codes = real_day["_real_code_digits"].tolist() if "_real_code_digits" in real_day.columns else [None] * len(real_day)
             pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
 
@@ -626,24 +623,18 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
                 used_pm = set(j for j in assign if j is not None)
 
-                # fill real rows
                 for i in range(len(real_day)):
                     r = real_day.iloc[i].copy()
                     j = assign[i] if i < len(assign) else None
                     if j is not None and j < len(pm_day):
                         pm_row = pm_day.iloc[j]
                         r["Code PM"] = pm_row["Code PM"]
-
                         diff = None
                         if rt_minutes[i] is not None:
-                            pm_min = pm_tv_min_safe(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
+                            pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
                             if pm_min < 10**9:
                                 diff = abs(rt_minutes[i] - pm_min)
-
-                        if diff is not None and diff > DECALAGE_MINUTES:
-                            r["Commentaire"] = "Décalage"
-                        else:
-                            r["Commentaire"] = None
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
                     else:
                         r["Code PM"] = None
                         if backlog_by_support[sn] > 0:
@@ -666,8 +657,8 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 t = to_excel_time(row.get("heure de diffusion"))
                 if t is not None:
                     return real_tv_minutes(t)
-                _, _, tvm = parse_codepm_time(row.get("Code PM"))
-                return tvm if tvm is not None else 10**9
+                # ✅ PM tv-day minutes for non diffusé rows
+                return pm_tv_minutes_tvday(row.get("Code PM"), None)
 
             if not df_filled.empty:
                 df_filled["_sort_t"] = df_filled.apply(lambda rr: sort_key_tv(rr), axis=1)
@@ -678,6 +669,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
             out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
                      if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
 
+            # ✅ tri final garantit insertion Non diffusé au bon ordre horaire dans la journée
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
             out_all.append(out_day[FINAL_COLUMNS_IMPERIUM])
 
@@ -730,12 +722,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
         real_s = df[df["support_norm"] == sn].copy()
         pm_s = pm[pm["support_norm"] == sn].copy()
 
-        if not real_s.empty:
-            sup_display = str(real_s.iloc[0]["Chaîne"])
-        elif not pm_s.empty:
-            sup_display = str(pm_s.iloc[0]["supportp"])
-        else:
-            sup_display = str(sn)
+        sup_display = str(real_s.iloc[0]["Chaîne"]) if not real_s.empty else (str(pm_s.iloc[0]["supportp"]) if not pm_s.empty else str(sn))
 
         dates_real = set(real_s["date_only"].dropna().unique())
         dates_pm = set(pm_s["date_only"].dropna().unique())
@@ -751,11 +738,11 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
 
             pm_day = pm_s[pm_s["date_only"] == d].copy()
             if not pm_day.empty:
-                pm_day["_PM_TV_MIN_SAFE"] = pm_day.apply(lambda r: pm_tv_min_safe(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
-                pm_day = pm_day.sort_values("_PM_TV_MIN_SAFE", na_position="last").drop(columns=["_PM_TV_MIN_SAFE"], errors="ignore")
+                pm_day["_PM_TV_MIN_TVDAY"] = pm_day.apply(lambda r: pm_tv_minutes_tvday(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
+                pm_day = pm_day.sort_values("_PM_TV_MIN_TVDAY", na_position="last").drop(columns=["_PM_TV_MIN_TVDAY"], errors="ignore")
 
             rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
-            pm_minutes = [pm_tv_min_safe(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
+            pm_minutes = [pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
 
             real_codes = real_day["_real_code_digits"].tolist() if "_real_code_digits" in real_day.columns else [None] * len(real_day)
             pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
@@ -780,14 +767,11 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
 
                         diff = None
                         if rt_minutes[i] is not None:
-                            pm_min = pm_tv_min_safe(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
+                            pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
                             if pm_min < 10**9:
                                 diff = abs(rt_minutes[i] - pm_min)
 
-                        if diff is not None and diff > DECALAGE_MINUTES:
-                            r["Commentaire"] = "Décalage"
-                        else:
-                            r["Commentaire"] = None
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
                     else:
                         r["Code Ecran PM"] = None
                         if backlog_by_support[sn] > 0:
@@ -809,8 +793,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                 t = to_excel_time(row.get("H.Début"))
                 if t is not None:
                     return real_tv_minutes(t)
-                _, _, tvm = parse_codepm_time(row.get("Code Ecran PM"))
-                return tvm if tvm is not None else 10**9
+                return pm_tv_minutes_tvday(row.get("Code Ecran PM"), None)
 
             if not df_filled.empty:
                 df_filled["_sort_t"] = df_filled.apply(lambda rr: sort_key_tv_yumi(rr), axis=1)
@@ -821,6 +804,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
             out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
                      if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
 
+            # ✅ tri final garantit insertion Non diffusé au bon ordre horaire dans la journée
             out_day = out_day.sort_values("_sort_t", na_position="last").drop(columns=["_sort_t"], errors="ignore")
             out_all.append(out_day[FINAL_COLUMNS_YUMI])
 
