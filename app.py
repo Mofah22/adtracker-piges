@@ -27,7 +27,7 @@ DATA_START_ROW = 10
 DECALAGE_MINUTES = 45
 TV_DAY_CUTOFF_HOUR = 6  # journée TV: 00:00-05:59 => fin journée => +1440
 
-# ✅ Règle validée: ordre + swap intelligent (sans anticipé) (fallback only)
+# ✅ Règle validée: ordre + swap intelligent (fallback only)
 SWAP_NEAR_MINUTES = 5
 SWAP_PM1_FAR_MINUTES = 20
 ANTI_VOL_NEXT_MAX = 20
@@ -39,9 +39,9 @@ COMPENSATION_MAX_MINUTES = 20
 # ✅ YUMI: on ne génère QUE ces chaînes (même si PM contient d'autres)
 ALLOWED_YUMI = {"2M", "ALAOULA"}
 
-# ✅ Matching optimal (corrige le cas EXEED: laisser un PM "Non diffusé" plutôt que forcer l'ordre)
+# ✅ Matching optimal (corrige le cas EXEED + cas "Non diffusé" vs "Passage supplémentaire")
 USE_OPTIMAL_MATCHING = True
-PM_SKIP_PENALTY = 30       # coût de laisser un PM en Non diffusé
+PM_SKIP_PENALTY = 30       # coût de laisser un PM en Non diffusé (si autorisé)
 REAL_SKIP_PENALTY = 30     # coût de laisser une diffusion sans PM (passage supp/comp)
 HARD_MAX_MATCH = 180       # au-delà (minutes), on décourage fortement le match
 
@@ -345,6 +345,7 @@ def should_swap(rt_i, pm_i, pm_j, rt_next=None):
 # Matching engine:
 # - Exact lock (digits)
 # - Optimal DP matching (default)
+# - NEW RULE: if A>=B (more real than PM) => forbid "Non diffusé"
 # - Fallback ordre+swap if USE_OPTIMAL_MATCHING=False
 # =========================
 def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes):
@@ -400,16 +401,22 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
     A = len(real_rem)
     B = len(pm_rem)
 
+    # ✅ NEW: no "Non diffusé" if we have extra real (A >= B and B>0)
+    pm_skip_penalty = PM_SKIP_PENALTY
+    real_skip_penalty = REAL_SKIP_PENALTY
+    if A >= B and B > 0:
+        pm_skip_penalty = 10**12  # effectively forbidden
+
     dp = [[INF] * (B + 1) for _ in range(A + 1)]
     prev = [[None] * (B + 1) for _ in range(A + 1)]
     dp[0][0] = 0
 
     for b in range(1, B + 1):
-        dp[0][b] = dp[0][b - 1] + PM_SKIP_PENALTY
+        dp[0][b] = dp[0][b - 1] + pm_skip_penalty
         prev[0][b] = ("SKIP_PM", 0, b - 1)
 
     for a in range(1, A + 1):
-        dp[a][0] = dp[a - 1][0] + REAL_SKIP_PENALTY
+        dp[a][0] = dp[a - 1][0] + real_skip_penalty
         prev[a][0] = ("SKIP_REAL", a - 1, 0)
 
     def match_cost(rt, pmv):
@@ -430,12 +437,12 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
             best = dp[a - 1][b - 1] + match_cost(rt, pmv)
             best_prev = ("MATCH", a - 1, b - 1)
 
-            c_spm = dp[a][b - 1] + PM_SKIP_PENALTY
+            c_spm = dp[a][b - 1] + pm_skip_penalty
             if c_spm < best:
                 best = c_spm
                 best_prev = ("SKIP_PM", a, b - 1)
 
-            c_sreal = dp[a - 1][b] + REAL_SKIP_PENALTY
+            c_sreal = dp[a - 1][b] + real_skip_penalty
             if c_sreal < best:
                 best = c_sreal
                 best_prev = ("SKIP_REAL", a - 1, b)
@@ -604,10 +611,9 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: da
     return out
 
 # =========================
-# Fill IMPERIUM per client (NO anticipé)
-# ✅ AMÉLIORATION DEMANDÉE:
-#    - ne pas créer de supports / dates à partir du PM
-#    - uniquement supports & dates présents dans la DATA uploadée
+# Fill IMPERIUM per client
+# ✅ Support/date stricts = uniquement DATA uploadée (pas PM-only)
+# ✅ Non diffusé possible seulement s'il n'y a PAS de passage supplémentaire selon DP rule
 # =========================
 def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -635,7 +641,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     out_all = []
     backlog_by_support = {}  # support_norm -> list[int tv_minutes]
 
-    # ✅ SUPPORTS = UNIQUEMENT ceux présents dans la DATA uploadée
+    # ✅ supports = only those in DATA
     supports_real = set(df["support_norm"].dropna().unique())
     all_supports = sorted(list(supports_real))
 
@@ -646,7 +652,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         row["Code PM"] = codepm
         row["Commentaire"] = "Non diffusé"
         if pm_seq is not None:
-            row["_pm_seq"] = pm_seq  # ordre PM
+            row["_pm_seq"] = pm_seq
         return row
 
     for sn in all_supports:
@@ -657,7 +663,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
         sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else str(sn)
 
-        # ✅ DATES = UNIQUEMENT celles présentes dans la DATA uploadée
+        # ✅ dates = only those in DATA
         dates_real = set(real_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real))
 
@@ -692,15 +698,17 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 if j is not None and j < len(pm_day):
                     pm_row = pm_day.iloc[j]
                     r["Code PM"] = pm_row["Code PM"]
+
                     diff = None
                     if rt_minutes[i] is not None:
                         pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
                         if pm_min < 10**9:
                             diff = abs(rt_minutes[i] - pm_min)
+
                     r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
                 else:
                     r["Code PM"] = None
-                    # ✅ Compensation seulement si proche d'un PM backlog
+                    # Compensation only if close to backlog
                     if backlog_by_support[sn] and rt_minutes[i] is not None:
                         diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
                         best_k = int(pd.Series(diffs).idxmin()) if diffs else None
@@ -713,7 +721,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                         r["Commentaire"] = "Passage supplémentaire"
                 filled_rows.append(r)
 
-            # remaining pm => Non diffusé (mais uniquement pour dates présentes dans DATA)
             remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
             for j in remaining_pm:
                 inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"], pm_seq=j))
@@ -740,8 +747,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 if "_pm_seq" not in df_insert.columns:
                     df_insert["_pm_seq"] = 10**9
 
-            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
-                     if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
+            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True)
 
             if not out_day.empty:
                 out_day = out_day.sort_values(["_sort_t", "_pm_seq"], na_position="last")
@@ -754,7 +760,8 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     return out_df[FINAL_COLUMNS_IMPERIUM]
 
 # =========================
-# Fill YUMI per client (NO anticipé)
+# Fill YUMI per client
+# ✅ Chains restricted to 2M & ALAOULA
 # =========================
 def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -780,8 +787,6 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm = set(pm["support_norm"].dropna().unique())
     all_supports = sorted(list(supports_real | supports_pm))
-
-    # ✅ YUMI: uniquement 2M & ALAOULA
     all_supports = [sn for sn in all_supports if sn in ALLOWED_YUMI]
 
     def insert_minimal_row_yumi(dte, chaine, codepm, pm_seq=None):
@@ -895,8 +900,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                 if "_pm_seq" not in df_insert.columns:
                     df_insert["_pm_seq"] = 10**9
 
-            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True) \
-                     if (not df_filled.empty or not df_insert.empty) else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
+            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True)
 
             if not out_day.empty:
                 out_day = out_day.sort_values(["_sort_t", "_pm_seq"], na_position="last")
