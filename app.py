@@ -27,7 +27,7 @@ DATA_START_ROW = 10
 DECALAGE_MINUTES = 45
 TV_DAY_CUTOFF_HOUR = 6  # journée TV: 00:00-05:59 => fin journée => +1440
 
-# ✅ Règle validée: ordre + swap intelligent (sans anticipé) (fallback only)
+# ✅ Règle validée: ordre + swap intelligent (sans anticipé)
 SWAP_NEAR_MINUTES = 5
 SWAP_PM1_FAR_MINUTES = 20
 ANTI_VOL_NEXT_MAX = 20
@@ -235,9 +235,11 @@ def code_hhmm_digits(x):
     if x is None:
         return None
     s = str(x).strip().upper().replace("H", ":")
+    # 3/4 digits anywhere
     m = re.search(r"(\d{3,4})", s)
     if m:
         return m.group(1)
+    # hh[:|-]mm
     m2 = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{2})", s)
     if m2:
         hh = int(m2.group(1))
@@ -279,7 +281,7 @@ def real_tv_minutes(t: time, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
 def pm_tv_minutes_tvday(code_pm: str, fallback=None, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
     """
     Minutes TV-DAY pour PM:
-    - si hh < cutoff (et hh < 24) => +1440
+    - si hh < cutoff (et hh < 24) => +1440 (fin de journée)
     - si hh >= 24 => garde tel quel
     """
     try:
@@ -318,9 +320,15 @@ def get_min_max_date_from_raw(df_in: pd.DataFrame, mode: str):
     return s.dt.date.min(), s.dt.date.max()
 
 # =========================
-# Swap decision (fallback)
+# Swap decision (ordre + anti-vol)
 # =========================
 def should_swap(rt_i, pm_i, pm_j, rt_next=None):
+    """
+    Swap autorisé si:
+      - d2 <= 5 minutes ET d1 > 20 minutes
+    MAIS on bloque si la diffusion suivante a vraiment besoin de PM2:
+      - e2 <= 20 AND e2 < e1 AND e1 > d1
+    """
     if rt_i is None:
         return False
 
@@ -342,12 +350,15 @@ def should_swap(rt_i, pm_i, pm_j, rt_next=None):
     return True
 
 # =========================
-# Matching engine:
-# - Exact lock (digits)
-# - Optimal DP matching (default)
-# - Fallback ordre+swap if USE_OPTIMAL_MATCHING=False
+# Matching engine
+#   - Exact match lock (digits)
+#   - Puis matching optimal (DP) qui autorise "skipper PM" => Non diffusé
+#   - (fallback ordre+swap possible si USE_OPTIMAL_MATCHING=False)
 # =========================
 def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes):
+    """
+    Return: assign list len(rt): assign[i] = j index in pm list or None
+    """
     n = len(rt_minutes)
     m = len(pm_minutes)
 
@@ -355,7 +366,7 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
     used_pm = set()
     locked_real = set()
 
-    # 0) exact match first (digits), choose first available PM
+    # ---- 0) exact match first (digits hhmm), choix = premier PM dispo
     if real_codes and pm_codes and len(real_codes) == n and len(pm_codes) == m:
         for i in range(n):
             rc = real_codes[i]
@@ -374,12 +385,13 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
     pm_rem = [j for j in range(m) if j not in used_pm]
 
     if not USE_OPTIMAL_MATCHING:
-        # order + swap fallback (without breaking exact match)
+        # Fallback: ordre + swap (sans casser exact match)
         remaining_real = [i for i in range(n) if assign[i] is None]
         k = min(len(remaining_real), len(pm_rem))
         for idx in range(k):
             assign[remaining_real[idx]] = pm_rem[idx]
 
+        # swap pass (mais pas sur locked)
         for i in range(n - 1):
             if i in locked_real or (i + 1) in locked_real:
                 continue
@@ -395,7 +407,7 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
                 assign[i], assign[i + 1] = assign[i + 1], assign[i]
         return assign
 
-    # DP alignment
+    # ---- 1) DP (sequence alignment) sur les restants
     INF = 10**15
     A = len(real_rem)
     B = len(pm_rem)
@@ -443,17 +455,18 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
             dp[a][b] = best
             prev[a][b] = best_prev
 
+    # backtrack
     a, b = A, B
-    pairs = []
+    chosen_pairs = []
     while a > 0 or b > 0:
         step, pa, pb = prev[a][b]
         if step == "MATCH":
             i = real_rem[a - 1]
             j = pm_rem[b - 1]
-            pairs.append((i, j))
+            chosen_pairs.append((i, j))
         a, b = pa, pb
 
-    for i, j in pairs:
+    for i, j in chosen_pairs:
         assign[i] = j
 
     return assign
@@ -605,9 +618,6 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: da
 
 # =========================
 # Fill IMPERIUM per client (NO anticipé)
-# ✅ AMÉLIORATION DEMANDÉE:
-#    - ne pas créer de supports / dates à partir du PM
-#    - uniquement supports & dates présents dans la DATA uploadée
 # =========================
 def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -635,9 +645,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     out_all = []
     backlog_by_support = {}  # support_norm -> list[int tv_minutes]
 
-    # ✅ SUPPORTS = UNIQUEMENT ceux présents dans la DATA uploadée
     supports_real = set(df["support_norm"].dropna().unique())
-    all_supports = sorted(list(supports_real))
+    supports_pm = set(pm["support_norm"].dropna().unique())
+    all_supports = sorted(list(supports_real | supports_pm))
 
     def insert_non_diffuse_row(dte, sup_disp, codepm, pm_seq=None):
         row = {c: None for c in FINAL_COLUMNS_IMPERIUM}
@@ -655,11 +665,11 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
         real_s = df[df["support_norm"] == sn].copy()
         pm_s = pm[pm["support_norm"] == sn].copy()
 
-        sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else str(sn)
+        sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else (str(pm_s.iloc[0]["supportp"]) if not pm_s.empty else str(sn))
 
-        # ✅ DATES = UNIQUEMENT celles présentes dans la DATA uploadée
         dates_real = set(real_s["date_only"].dropna().unique())
-        all_dates = sorted(list(dates_real))
+        dates_pm = set(pm_s["date_only"].dropna().unique())
+        all_dates = sorted(list(dates_real | dates_pm))
 
         for d in all_dates:
             if d < date_min or d > date_max:
@@ -683,43 +693,49 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
             filled_rows = []
             inserted_rows = []
 
-            assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
-            used_pm = set(j for j in assign if j is not None)
+            if len(real_day) == 0 and len(pm_day) > 0:
+                for j, (_, p) in enumerate(pm_day.iterrows()):
+                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, p["Code PM"], pm_seq=j))
+                    pm_min = pm_tv_minutes_tvday(p["Code PM"], p.get("PM_TV_MIN"))
+                    if pm_min < 10**9:
+                        backlog_by_support[sn].append(pm_min)
+            else:
+                assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
+                used_pm = set(j for j in assign if j is not None)
 
-            for i in range(len(real_day)):
-                r = real_day.iloc[i].copy()
-                j = assign[i] if i < len(assign) else None
-                if j is not None and j < len(pm_day):
-                    pm_row = pm_day.iloc[j]
-                    r["Code PM"] = pm_row["Code PM"]
-                    diff = None
-                    if rt_minutes[i] is not None:
-                        pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
-                        if pm_min < 10**9:
-                            diff = abs(rt_minutes[i] - pm_min)
-                    r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
-                else:
-                    r["Code PM"] = None
-                    # ✅ Compensation seulement si proche d'un PM backlog
-                    if backlog_by_support[sn] and rt_minutes[i] is not None:
-                        diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
-                        best_k = int(pd.Series(diffs).idxmin()) if diffs else None
-                        if best_k is not None and diffs[best_k] <= COMPENSATION_MAX_MINUTES:
-                            r["Commentaire"] = "Compensation"
-                            backlog_by_support[sn].pop(best_k)
+                for i in range(len(real_day)):
+                    r = real_day.iloc[i].copy()
+                    j = assign[i] if i < len(assign) else None
+                    if j is not None and j < len(pm_day):
+                        pm_row = pm_day.iloc[j]
+                        r["Code PM"] = pm_row["Code PM"]
+                        diff = None
+                        if rt_minutes[i] is not None:
+                            pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
+                            if pm_min < 10**9:
+                                diff = abs(rt_minutes[i] - pm_min)
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                    else:
+                        r["Code PM"] = None
+                        # ✅ Compensation seulement si proche d'un PM backlog
+                        if backlog_by_support[sn] and rt_minutes[i] is not None:
+                            diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
+                            best_k = int(pd.Series(diffs).idxmin()) if diffs else None
+                            if best_k is not None and diffs[best_k] <= COMPENSATION_MAX_MINUTES:
+                                r["Commentaire"] = "Compensation"
+                                backlog_by_support[sn].pop(best_k)
+                            else:
+                                r["Commentaire"] = "Passage supplémentaire"
                         else:
                             r["Commentaire"] = "Passage supplémentaire"
-                    else:
-                        r["Commentaire"] = "Passage supplémentaire"
-                filled_rows.append(r)
+                    filled_rows.append(r)
 
-            # remaining pm => Non diffusé (mais uniquement pour dates présentes dans DATA)
-            remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
-            for j in remaining_pm:
-                inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"], pm_seq=j))
-                pm_min = pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN"))
-                if pm_min < 10**9:
-                    backlog_by_support[sn].append(pm_min)
+                remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
+                for j in remaining_pm:
+                    inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"], pm_seq=j))
+                    pm_min = pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN"))
+                    if pm_min < 10**9:
+                        backlog_by_support[sn].append(pm_min)
 
             df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame()
             df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
@@ -775,7 +791,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
     pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
 
     out_all = []
-    backlog_by_support = {}
+    backlog_by_support = {}  # support_norm -> list[int tv_minutes]
 
     supports_real = set(df["support_norm"].dropna().unique())
     supports_pm = set(pm["support_norm"].dropna().unique())
@@ -857,6 +873,7 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                         r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
                     else:
                         r["Code Ecran PM"] = None
+                        # ✅ Compensation seulement si proche d'un PM backlog
                         if backlog_by_support[sn] and rt_minutes[i] is not None:
                             diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
                             best_k = int(pd.Series(diffs).idxmin()) if diffs else None
@@ -1000,6 +1017,7 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
         sheet_title = lambda sup: safe_sheet_name(f"{client_name} - {str(sup).strip()}")
         total_col_name = "Code PM"
     else:
+        # ✅ YUMI: uniquement 2M & ALAOULA
         supports = [s for s in df_client["Chaîne"].dropna().unique()
                     if normalize_support(s) in ALLOWED_YUMI]
         get_sub = lambda sup: df_client[df_client["Chaîne"] == sup].copy()
@@ -1069,7 +1087,7 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                     raise ValueError("Impossible de détecter min/max date dans la data brute.")
 
                 date_min = min_raw
-                date_max = min(max_date_ui, max_raw)
+                date_max = min(max_date_ui, max_raw)  # ✅ borné par la data brute
                 st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
 
                 if mode == "Suivi Imperium":
@@ -1080,6 +1098,8 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                     df_all = build_final_df_from_yumi(df_in, date_min=date_min, date_max=date_max)
                     final_cols = FINAL_COLUMNS_YUMI
                     client_col = "Marque"
+
+                    # ✅ YUMI: on peut aussi filtrer la DATA dès ici (optionnel mais propre)
                     df_all = df_all[df_all["support_norm"].isin(ALLOWED_YUMI)].copy()
 
                 known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
@@ -1097,16 +1117,22 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                         ].copy()
 
                     if mode == "Suivi Imperium":
-                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
+                        df_client_done = fill_codepm_commentaire_per_client(
+                            df_client_raw, pm_client, date_min=date_min, date_max=date_max
+                        )
                     else:
-                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
+                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(
+                            df_client_raw, pm_client, date_min=date_min, date_max=date_max
+                        )
 
                     df_client_done = df_client_done.copy()
                     for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
                         df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
 
                     template_wb = load_template_workbook(mode)
-                    xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, final_cols, mode=mode)
+                    xlsx_bytes = build_client_workbook_from_template(
+                        template_wb, client_name, df_client_done, final_cols, mode=mode
+                    )
                     client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
 
                 st.session_state.client_files = client_files
