@@ -10,7 +10,6 @@ import streamlit as st
 import openpyxl
 from copy import copy as pycopy
 
-# ✅ Bordures + gris sur Total
 from openpyxl.styles import PatternFill, Border, Side
 
 # =========================
@@ -24,23 +23,23 @@ TEMPLATE_YUMI_PATH = APP_DIR / "SUIVI GATO.xlsx"
 HEADER_ROW = 9
 DATA_START_ROW = 10
 
-DECALAGE_MINUTES = 45
+# ✅ Règle Décalage (mise à jour)
+DECALAGE_MINUTES = 60
+
 TV_DAY_CUTOFF_HOUR = 6  # journée TV: 00:00-05:59 => fin journée => +1440
 
-# ✅ Règle validée: ordre + swap intelligent (fallback only)
+# ✅ swap fallback only
 SWAP_NEAR_MINUTES = 5
 SWAP_PM1_FAR_MINUTES = 20
 ANTI_VOL_NEXT_MAX = 20
-LOOKAHEAD_STEPS = 1
 
 # ✅ Compensation backlog (règle finale)
 COMPENSATION_NEAR_MINUTES = 120  # <= 2h => Compensation automatique (consomme backlog)
-# si >2h : 07:00-24:00 => "Compensation (loin)" ; 24:00-07:00 => "Passage supplémentaire"
 
-# ✅ YUMI: on ne génère QUE ces chaînes (même si PM contient d'autres)
+# ✅ YUMI: on ne génère QUE ces chaînes
 ALLOWED_YUMI = {"2M", "ALAOULA"}
 
-# ✅ Matching optimal (corrige EXEED + interdit Non diffusé si diffusions >= PM)
+# ✅ Matching optimal
 USE_OPTIMAL_MATCHING = True
 PM_SKIP_PENALTY = 30
 REAL_SKIP_PENALTY = 30
@@ -322,10 +321,30 @@ def should_swap(rt_i, pm_i, pm_j, rt_next=None):
     return True
 
 # =========================
+# Post-fix: force match if PM still available
+# =========================
+def force_assign_unmatched_reals(assign, rt_minutes, pm_minutes):
+    used = set(j for j in assign if j is not None)
+    remaining_pm = [j for j in range(len(pm_minutes)) if j not in used]
+    if not remaining_pm:
+        return assign
+
+    for i in range(len(assign)):
+        if assign[i] is not None:
+            continue
+        if not remaining_pm:
+            break
+        rt = rt_minutes[i]
+        if rt is None or rt >= 10**9:
+            continue
+        best_j = min(remaining_pm, key=lambda j: abs(rt - pm_minutes[j]) if pm_minutes[j] < 10**9 else 10**9)
+        assign[i] = best_j
+        remaining_pm.remove(best_j)
+
+    return assign
+
+# =========================
 # Matching engine (Exact + DP)
-#   - Exact lock (digits) (order PM)
-#   - DP optimal
-#   - forbid "Non diffusé" if A >= B
 # =========================
 def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes):
     n = len(rt_minutes)
@@ -374,17 +393,14 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
                 assign[i], assign[i + 1] = assign[i + 1], assign[i]
         return assign
 
-    # DP alignment
     INF = 10**15
     A = len(real_rem)
     B = len(pm_rem)
 
     pm_skip_penalty = PM_SKIP_PENALTY
     real_skip_penalty = REAL_SKIP_PENALTY
-
-    # ✅ forbid "Non diffusé" if extra diffusions exist (A>=B)
     if A >= B and B > 0:
-        pm_skip_penalty = 10**12
+        pm_skip_penalty = 10**12  # forbid "Non diffusé"
 
     dp = [[INF] * (B + 1) for _ in range(A + 1)]
     prev = [[None] * (B + 1) for _ in range(A + 1)]
@@ -591,8 +607,6 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: da
 
 # =========================
 # Fill IMPERIUM per client
-# ✅ supports/dates strictly from DATA (no PM-only sheets)
-# ✅ backlog compensation rule Q4/Q5 (near<=2h else depends on time window)
 # =========================
 def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -618,8 +632,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
 
     out_all = []
-    backlog_by_support = {}  # support_norm -> list[int tv_minutes]
+    backlog_by_support = {}
 
+    # ✅ only supports present in DATA
     supports_real = set(df["support_norm"].dropna().unique())
     all_supports = sorted(list(supports_real))
 
@@ -641,6 +656,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
         sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else str(sn)
 
+        # ✅ only dates present in DATA
         dates_real = set(real_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real))
 
@@ -666,6 +682,9 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
             pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
 
             assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
+            # ✅ FIX: force match if PM still available
+            assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
+
             used_pm = set(j for j in assign if j is not None)
 
             filled_rows = []
@@ -689,7 +708,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 else:
                     r["Code PM"] = None
 
-                    # ✅ Q4/Q5 backlog logic
+                    # backlog logic Q4/Q5
                     if backlog_by_support[sn] and rt_minutes[i] is not None:
                         diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
                         best_k = int(pd.Series(diffs).idxmin()) if diffs else None
@@ -698,8 +717,8 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                             best_diff = diffs[best_k]
                             rt = rt_minutes[i]
 
-                            is_day_7_to_24 = (rt >= 7 * 60) and (rt < 24 * 60)  # [420,1440)
-                            is_after_24_to_7 = (rt >= 24 * 60) and (rt < (24 * 60 + 7 * 60))  # [1440,1860)
+                            is_day_7_to_24 = (rt >= 7 * 60) and (rt < 24 * 60)
+                            is_after_24_to_7 = (rt >= 24 * 60) and (rt < (24 * 60 + 7 * 60))
 
                             if best_diff <= COMPENSATION_NEAR_MINUTES:
                                 r["Commentaire"] = "Compensation"
@@ -758,8 +777,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
 # =========================
 # Fill YUMI per client
-# ✅ chains restricted to 2M & ALAOULA
-# ✅ backlog compensation rule Q4/Q5 (same logic as Imperium)
 # =========================
 def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -842,6 +859,8 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                         backlog_by_support[sn].append(pm_min)
             else:
                 assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
+                # ✅ FIX: force match if PM still available
+                assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
                 used_pm = set(j for j in assign if j is not None)
 
                 for i in range(len(real_day)):
@@ -861,7 +880,6 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                     else:
                         r["Code Ecran PM"] = None
 
-                        # ✅ Q4/Q5 backlog logic
                         if backlog_by_support[sn] and rt_minutes[i] is not None:
                             diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
                             best_k = int(pd.Series(diffs).idxmin()) if diffs else None
@@ -1116,22 +1134,16 @@ if st.button("Lancer la génération", use_container_width=True, disabled=(not t
                         ].copy()
 
                     if mode == "Suivi Imperium":
-                        df_client_done = fill_codepm_commentaire_per_client(
-                            df_client_raw, pm_client, date_min=date_min, date_max=date_max
-                        )
+                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
                     else:
-                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(
-                            df_client_raw, pm_client, date_min=date_min, date_max=date_max
-                        )
+                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
 
                     df_client_done = df_client_done.copy()
                     for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
                         df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
 
                     template_wb = load_template_workbook(mode)
-                    xlsx_bytes = build_client_workbook_from_template(
-                        template_wb, client_name, df_client_done, final_cols, mode=mode
-                    )
+                    xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, final_cols, mode=mode)
                     client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
 
                 st.session_state.client_files = client_files
