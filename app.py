@@ -682,7 +682,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
             pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
 
             assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
-            # ✅ FIX: force match if PM still available
             assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
 
             used_pm = set(j for j in assign if j is not None)
@@ -708,7 +707,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
                 else:
                     r["Code PM"] = None
 
-                    # backlog logic Q4/Q5
                     if backlog_by_support[sn] and rt_minutes[i] is not None:
                         diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
                         best_k = int(pd.Series(diffs).idxmin()) if diffs else None
@@ -859,7 +857,6 @@ def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_cli
                         backlog_by_support[sn].append(pm_min)
             else:
                 assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
-                # ✅ FIX: force match if PM still available
                 assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
                 used_pm = set(j for j in assign if j is not None)
 
@@ -962,7 +959,9 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
         dst.protection = pycopy(src.protection)
 
 def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: str):
-    ws["A6"].value = None
+    # ✅ A6: YUMI="Cible" ; Imperium vide
+    ws["A6"].value = "Cible" if mode == "Suivi YUMI" else None
+
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
 
@@ -982,32 +981,43 @@ def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: s
     if last_data_row < DATA_START_ROW:
         last_data_row = DATA_START_ROW
 
-    count_vals = 0
-    for r in range(DATA_START_ROW, last_data_row + 1):
-        if ws.cell(r, total_col_idx).value not in (None, ""):
-            count_vals += 1
-
     total_row = last_data_row + 1
     ws.insert_rows(total_row)
     apply_row_style_from_template(style_row_cells, ws, total_row, final_cols)
 
+    # ✅ A="Total", B vide
     ws.cell(total_row, 1).value = "Total"
-    ws.cell(total_row, 2).value = count_vals
+    ws.cell(total_row, 2).value = None
 
     grey_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
     thin = Side(style="thin", color="000000")
     thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for col in (1, 2):
-        cell = ws.cell(total_row, col)
+    def paint_grey_border(col_idx: int):
+        cell = ws.cell(total_row, col_idx)
+        if col_idx != 1:
+            cell.value = None
         cell.fill = grey_fill
         cell.border = thin_border
         cell.font = pycopy(cell.font)
         cell.font = cell.font.copy(bold=True)
 
+    # ✅ Always A & B grey + borders
+    paint_grey_border(1)
+    paint_grey_border(2)
+
+    # ✅ YUMI only: also T & U (20 & 21) grey + borders (empty)
+    if mode == "Suivi YUMI" and len(final_cols) >= 21:
+        paint_grey_border(20)
+        paint_grey_border(21)
+
+    # ✅ Other columns: empty + no border/fill (except YUMI T/U already styled)
     empty_border = Border()
     empty_fill = PatternFill(fill_type=None)
+
     for col in range(3, len(final_cols) + 1):
+        if mode == "Suivi YUMI" and col in (20, 21):
+            continue
         cell = ws.cell(total_row, col)
         cell.value = None
         cell.border = empty_border
