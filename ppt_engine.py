@@ -767,7 +767,7 @@ class PPTInjector:
         medias     = calc.medias_present  # ex: ["AF","TV","PR","RD"]
 
         # ── Lire tout le ZIP en mémoire ───────────────────────────────
-        original: dict[str, bytes] = {}
+        original: dict = {}
         with zipfile.ZipFile(io.BytesIO(self.template_bytes_raw), "r") as zin:
             for item in zin.infolist():
                 original[item.filename] = zin.read(item.filename)
@@ -788,7 +788,7 @@ class PPTInjector:
         ch3 = process_chart3_seasonality(original["ppt/charts/chart3.xml"], years, seas)
 
         # Charts annonceurs slide3
-        years_ann = list(reversed(years[-3:])) if len(years)>=3 else list(reversed(years))
+        years_ann = years[-3:] if len(years)>=3 else years  # 2023 gauche, 2024 milieu, 2025 droite
         ch4 = ch5 = ch6 = None
         for i, (chart_id, y) in enumerate(zip([4,5,6], years_ann + [None]*(3-len(years_ann)))):
             if y is None: continue
@@ -836,6 +836,9 @@ class PPTInjector:
 
         # ── Textes slides fixes ───────────────────────────────────────
         slide_texts = {
+            "ppt/slides/slide1.xml": {
+                "Title 1": f"Media Review\n{label}\n| {yrange}",
+            },
             "ppt/slides/slide2.xml": {
                 "Text 0": f"Investissements média — {label}",
                 "Text 1": f"{yrange} | Millions MAD | Source : Imperium",
@@ -856,13 +859,15 @@ class PPTInjector:
             "ppt/slides/slide5.xml": {
                 "TextBox 2": f"Investissement média TV — {label}",
                 "TextBox 3": f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8": "Investissements TV",
                 "TextBox 9": f"Répartition {int(year_last)} par support",
                 "TextBox 10": f"Top annonceurs TV (FY {int(year_last)})",
                 "TextBox 15": comments.get("slide_tv",""),
             },
             "ppt/slides/slide6.xml": {
-                "TextBox 1": f"Investissement média RD — {label}",
+                "TextBox 1": f"Investissement média Radio — {label}",
                 "TextBox 2": f"{yrange} | Millions MAD | Source : Imperium",
+                "TextBox 7": "Investissements Radio",
                 "TextBox 8": f"Split par station — FY {int(year_last)}",
                 "TextBox 9": f"Top annonceurs RD — FY {int(year_last)}",
                 "TextBox 14": comments.get("slide_rd",""),
@@ -871,7 +876,7 @@ class PPTInjector:
 
         # ── Slides supplémentaires pour médias hors AF/TV/RD ──────────
         extra_medias = [m for m in medias if m not in ("AF","TV","RD")]
-        extra_files: dict[str, bytes] = {}
+        extra_files: dict = {}
         extra_slide_ids = []  # (slide_num, slide_path)
 
         next_slide_num = 7
