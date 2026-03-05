@@ -52,7 +52,7 @@ TOP_N_ANNONCEURS = 15
 TOP_N_SUPPORT    = 12
 
 # Format étiquettes millions
-FMT_MILLIONS = "0.0"     # valeurs déjà en millions dans le cache
+FMT_MILLIONS = "0.0"     # valeurs en millions MADs dans le cache
 FMT_PERCENT  = '0%'
 
 
@@ -118,8 +118,20 @@ class MediaCalculator:
     def top_ann_focus_last(self, code, n=TOP_N_ANNONCEURS) -> pd.Series:
         return self._focus(code)[self._focus(code)["Anp"]==self.year_last].groupby("Marque")["tarif"].sum().sort_values(ascending=False).head(n)
 
-    def split_support_last(self, code, n=TOP_N_SUPPORT) -> pd.Series:
-        return self._focus(code)[self._focus(code)["Anp"]==self.year_last].groupby("supportp")["tarif"].sum().sort_values(ascending=False).head(n)
+    def split_support_last(self, code, n=TOP_N_SUPPORT, seuil_pct=3.0) -> pd.Series:
+        """Retourne la repartition par support, les petites tranches < seuil_pct% regroupees en Autres."""
+        s = self._focus(code)[self._focus(code)["Anp"]==self.year_last].groupby("supportp")["tarif"].sum().sort_values(ascending=False)
+        if s.empty:
+            return s
+        total = s.sum()
+        mask_small = (s / total * 100) < seuil_pct
+        main = s[~mask_small].head(n)
+        autres_val = s[mask_small].sum()
+        if autres_val > 0:
+            import pandas as _pd
+            autres = _pd.Series({"Autres": autres_val})
+            main = _pd.concat([main, autres])
+        return main
 
     def evol_pct(self, new, old):
         return (new-old)/abs(old)*100 if old and old != 0 else None
@@ -165,7 +177,7 @@ class MediaCalculator:
                 sup = self.split_support_last(code)
                 if len(sup):
                     tot = sub.get(self.year_last,0)
-                    s[f"{code}_top_sup"]     = sup.index[0]
+                    s[f"{code}_top_sup"]     = sup.index[0].replace("_"," ").upper()
                     s[f"{code}_top_sup_pct"] = sup.iloc[0]/tot*100 if tot else 0
                 ann = self.top_ann_focus_last(code)
                 if len(ann):
@@ -206,10 +218,21 @@ Top annonceur: {stats.get('top1_ann','')} — {fm(stats.get('top1_val'))} — SO
         slides_json += f',\n  "slide_{c.lower()}": "commentaire {MEDIA_LABELS.get(c,c)}"'
     slides_json += "\n}"
 
-    prompt = f"""Expert media planner Maroc. Génère commentaires analytiques CONCIS pour Media Review PPT.
-Données:\n{ctx}
+    prompt = f"""Tu es un expert media planner senior au Maroc avec 15 ans d'expérience en analyse des investissements publicitaires.
+Génère des commentaires analytiques DÉTAILLÉS et PERCUTANTS pour un Media Review PPT professionnel.
 
-JSON uniquement (2-4 phrases par commentaire, chiffres clés en M MAD et %, ton professionnel):
+Données secteur:\n{ctx}
+
+RÈGLES IMPÉRATIVES :
+- 4 à 6 phrases par commentaire minimum
+- Citer les chiffres exacts en M MAD et en %
+- Comparer systématiquement les 3 années (évolutions, tendances)
+- Identifier les leaders, les gagnants et les perdants
+- Donner une lecture stratégique (pourquoi ces chiffres, quelle implication)
+- Ton analytique et professionnel, phrases courtes et percutantes
+- JAMAIS de formules génériques — chaque commentaire doit être spécifique aux données
+
+Retourne UNIQUEMENT un JSON valide (sans markdown, sans backticks) :
 {slides_json}"""
 
     try:
@@ -232,7 +255,33 @@ JSON uniquement (2-4 phrases par commentaire, chiffres clés en M MAD et %, ton 
         }
         for c in ["AF","TV","PR","RD","CN"]:
             if stats.get(f"{c}_last"):
-                out[f"slide_{c.lower()}"] = f"{MEDIA_LABELS.get(c,c)} {yl} : {fm(stats.get(f'{c}_last'))} ({fp(stats.get(f'{c}_evol'))} vs {yp_l}). {stats.get(f'{c}_top_sup','')} = {stats.get(f'{c}_top_sup_pct',0):.0f}%. Leader : {stats.get(f'{c}_top1_ann','')} (SOS {stats.get(f'{c}_top1_sos',0):.0f}%)."
+                v_last = stats.get(f"{c}_last", 0)
+                v_prev = stats.get(f"{c}_prev", 0)
+                v_prev2 = stats.get(f"{c}_prev", 0)
+                evol = stats.get(f"{c}_evol")
+                top_sup = stats.get(f"{c}_top_sup", "")
+                top_pct = stats.get(f"{c}_top_sup_pct", 0)
+                top1 = stats.get(f"{c}_top1_ann", "")
+                top1_sos = stats.get(f"{c}_top1_sos", 0)
+                media_name = MEDIA_LABELS.get(c, c)
+                trend = "en hausse" if evol and evol > 0 else "en baisse"
+                if top1_sos > 50:
+                    dominance = "position dominante"
+                else:
+                    dominance = "marche fragmente"
+                if evol and evol > 10:
+                    trend_comment = "Tendance positive confirme un regain d'interet."
+                elif evol and evol < -10:
+                    trend_comment = "Tendance negative — reallocations vers autres medias."
+                else:
+                    trend_comment = "Evolution moderee — marche en stabilisation."
+                out[f"slide_{c.lower()}"] = (
+                    f"{media_name} {yl} : {fm(v_last)} ({fp(evol)} vs {yp_l}). "
+                    f"Le marche {media_name.lower()} est {trend} sur {yp2_l}-{yl}. "
+                    f"Support dominant : {top_sup} = {top_pct:.0f}% des invest. {yl}. "
+                    f"Leader : {top1} SOS {top1_sos:.0f}% ({dominance}). "
+                    f"{trend_comment}"
+                )
         return out
 
 
@@ -309,6 +358,33 @@ def _set_show_flags(dlbls_el, show_val="0", show_pct="0"):
             el.set("val", val)
 
 
+def _update_chart_formulas(chart_xml: bytes, sheet_name: str = "Sheet1") -> bytes:
+    """Ne fait rien - les formules sont mises a jour par _rebuild_cache."""
+    return chart_xml
+
+
+def _update_series_formula(ser_el, n_rows: int, col_cat: str = "A", col_val: str = "B",
+                            sheet: str = "Sheet1"):
+    """Met a jour les formules f d'une serie simple pour pointer sur n_rows lignes."""
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+    # Nom de serie (f dans tx/strRef)
+    tx_f = ser_el.find(f".//{{{ns}}}tx//{{{ns}}}f")
+    if tx_f is not None and tx_f.text and "!" in tx_f.text:
+        # Garder seulement la ref cellule header (1 cellule)
+        pass  # ne pas modifier le nom
+
+    # Catégories: col_cat$2:col_cat$N+1
+    cat_f = ser_el.find(f".//{{{ns}}}cat//{{{ns}}}f")
+    if cat_f is not None:
+        cat_f.text = f"{sheet}!${col_cat}$2:${col_cat}${n_rows + 1}"
+
+    # Valeurs: col_val$2:col_val$N+1
+    val_f = ser_el.find(f".//{{{ns}}}val//{{{ns}}}f")
+    if val_f is not None:
+        val_f.text = f"{sheet}!${col_val}$2:${col_val}${n_rows + 1}"
+
+
 def _rebuild_cache(ser_el, categories: list, values: list, divide_by: float = 1.0):
     """Met à jour catégories + valeurs dans le cache XML d'une série.
     divide_by : diviser les valeurs avant écriture (ex: 1e6 pour millions)
@@ -374,6 +450,27 @@ def _set_series_name(ser_el, name: str):
         tx_v.text = str(name)
 
 
+def _clean_support_name(name: str) -> str:
+    """Nettoie les noms de supports: underscores → espaces, MAJUSCULES."""
+    if not name:
+        return name
+    return name.replace("_", " ").upper()
+
+
+def _set_series_color(ser_el, hex_color: str):
+    """Definit la couleur de remplissage d'une serie (hex sans #)."""
+    dns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    spPr = ser_el.find(ctag("spPr"))
+    if spPr is None:
+        spPr = etree.SubElement(ser_el, ctag("spPr"))
+    for fill_tag in [f"{{{dns}}}solidFill", f"{{{dns}}}noFill", f"{{{dns}}}gradFill"]:
+        old = spPr.find(fill_tag)
+        if old is not None: spPr.remove(old)
+    solid = etree.SubElement(spPr, f"{{{dns}}}solidFill")
+    srgb = etree.SubElement(solid, f"{{{dns}}}srgbClr")
+    srgb.set("val", hex_color)
+
+
 def _build_peak_dlbls(ser_el, values: list, top_n: int = 3) -> None:
     """
     Pour la saisonnalité : supprime tous les dLbl individuels,
@@ -423,7 +520,9 @@ def process_chart1_annual(chart_xml: bytes, cats: list, vals: list) -> bytes:
     sers = root.findall(f".//{ctag('ser')}")
     if sers:
         _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
+        _update_series_formula(sers[0], len(cats))
         _set_series_name(sers[0], "Total")
+        _update_series_formula(sers[0], len(cats))
         dlbls = root.find(f".//{ctag('dLbls')}")
         if dlbls is not None:
             _set_num_fmt(dlbls, FMT_MILLIONS)
@@ -433,62 +532,149 @@ def process_chart1_annual(chart_xml: bytes, cats: list, vals: list) -> bytes:
 
 
 def process_chart2_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFrame) -> bytes:
-    """Répartition par média stacked 100% — étiquettes en %."""
+    """Répartition par média stacked 100% — etiquettes en %."""
+    from copy import deepcopy
     root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    media_order = ["AF","PR","RD","TV","CN"]
+    bar_chart = root.find(f".//{ctag('barChart')}")
+    if bar_chart is None:
+        return chart_xml
 
-    for i, m in enumerate(media_order):
-        if i >= len(sers): break
-        vals = [media_matrix.loc[y,m] if m in media_matrix.columns else None for y in years]
-        vals_clean = [v if v and v>0 else None for v in vals]
-        _rebuild_cache(sers[i], [int(y) for y in years], vals_clean, divide_by=1e6)
-        _set_series_name(sers[i], m)
+    # Médias présents dans la data (ordre fixe)
+    media_order = [m for m in ["AF","PR","RD","TV","CN"] if m in media_matrix.columns
+                   and media_matrix[m].sum() > 0]
 
-        # Ajouter dLbls sur la série si absent (PowerPoint ignore le dLbls global pour stacked)
-        dlbls = sers[i].find(ctag("dLbls"))
+    # Séries existantes
+    existing_sers = bar_chart.findall(ctag("ser"))
+
+    # Cloner/créer une série de référence pour chaque média
+    ref_ser = existing_sers[0] if existing_sers else None
+
+    # Supprimer toutes les séries existantes
+    for s in existing_sers:
+        bar_chart.remove(s)
+
+    # Trouver où insérer (avant dLbls/axId)
+    insert_before = bar_chart.find(ctag("dLbls"))
+    if insert_before is None:
+        insert_before = bar_chart.find(ctag("axId"))
+
+    # Couleurs TV et CN si non présentes dans le template
+    extra_colors = {"TV": "2563EB", "CN": "70AD47"}
+
+    for idx, m in enumerate(media_order):
+        # Utiliser la série originale correspondante si disponible (préserve la couleur)
+        orig_idx = ["AF", "PR", "RD", "TV", "CN"].index(m) if m in ["AF", "PR", "RD", "TV", "CN"] else idx
+        if orig_idx < len(existing_sers):
+            new_ser = deepcopy(existing_sers[orig_idx])
+        elif ref_ser is not None:
+            new_ser = deepcopy(ref_ser)
+            # Ajouter couleur spécifique si média sans couleur template
+            if m in extra_colors:
+                _set_series_color(new_ser, extra_colors[m])
+        else:
+            new_ser = etree.SubElement(bar_chart, ctag("ser"))
+
+        # idx série
+        idx_el = new_ser.find(ctag("idx"))
+        if idx_el is None: idx_el = etree.SubElement(new_ser, ctag("idx"))
+        idx_el.set("val", str(idx))
+        order_el = new_ser.find(ctag("order"))
+        if order_el is None: order_el = etree.SubElement(new_ser, ctag("order"))
+        order_el.set("val", str(idx))
+
+        # Nom de la série
+        _set_series_name(new_ser, m)
+
+        # Valeurs
+        vals = [media_matrix.loc[y, m] if y in media_matrix.index else 0 for y in years]
+        vals_clean = [v if v and v > 0 else None for v in vals]
+        _rebuild_cache(new_ser, [int(y) for y in years], vals_clean, divide_by=1e6)
+
+        # Labels %
+        dlbls = new_ser.find(ctag("dLbls"))
         if dlbls is None:
-            dlbls = etree.SubElement(sers[i], ctag("dLbls"))
-
-        # Vider et reconstruire proprement
+            dlbls = etree.SubElement(new_ser, ctag("dLbls"))
         for child in list(dlbls):
             dlbls.remove(child)
-
         nf = etree.SubElement(dlbls, ctag("numFmt"))
-        nf.set("formatCode", "0%")
-        nf.set("sourceLinked", "0")
+        nf.set("formatCode", "0%"); nf.set("sourceLinked", "0")
         for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
                          ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
-            el = etree.SubElement(dlbls, ctag(tag))
-            el.set("val", val)
+            etree.SubElement(dlbls, ctag(tag)).set("val", val)
 
-    # dLbls global sur barChart (fallback)
-    bar_chart = root.find(f".//{ctag('barChart')}")
-    if bar_chart is not None:
-        dlbls_g = bar_chart.find(ctag("dLbls"))
-        if dlbls_g is None:
-            dlbls_g = etree.SubElement(bar_chart, ctag("dLbls"))
-        _set_num_fmt(dlbls_g, "0%")
-        _set_show_flags(dlbls_g, show_val="0", show_pct="1")
+        # Insérer dans le barChart
+        if insert_before is not None:
+            bar_chart.insert(list(bar_chart).index(insert_before), new_ser)
+        else:
+            bar_chart.append(new_ser)
+
+    # Corriger le dLbls global du barChart: showPercent=1, showVal=0
+    gdlbls = bar_chart.find(ctag("dLbls"))
+    if gdlbls is None:
+        gdlbls = etree.SubElement(bar_chart, ctag("dLbls"))
+    for child in list(gdlbls):
+        gdlbls.remove(child)
+    pos = etree.SubElement(gdlbls, ctag("dLblPos"))
+    pos.set("val", "ctr")
+    nf = etree.SubElement(gdlbls, ctag("numFmt"))
+    nf.set("formatCode", "0%"); nf.set("sourceLinked", "0")
+    for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
+                     ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
+        etree.SubElement(gdlbls, ctag(tag)).set("val", val)
 
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
 def process_chart3_seasonality(chart_xml: bytes, years: list, seas: pd.DataFrame) -> bytes:
-    """Saisonnalité — valeurs en millions, étiquettes sur 3 pics par année."""
+    """Saisonnalite — valeurs en millions, etiquettes sur 3 pics par annee."""
     root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
+    line_chart = root.find(f".//{ctag('lineChart')}")
+    if line_chart is None:
+        return chart_xml
+
+    # Supprimer toutes les series existantes (inclut #REF! parasite)
+    existing = line_chart.findall(ctag("ser"))
+    for s in existing:
+        line_chart.remove(s)
+
+    # Trouver point d'insertion (avant axId/dLbls)
+    insert_before = line_chart.find(ctag("dLbls"))
+    if insert_before is None:
+        insert_before = line_chart.find(ctag("axId"))
+
+    ref_ser = existing[1] if len(existing) > 1 else (existing[0] if existing else None)
+
     all_vals = []
     for i, y in enumerate(years):
-        ser_idx = i + 1
-        if ser_idx >= len(sers): break
-        ser = sers[ser_idx]
-        month_vals = [seas.loc[y,m] if y in seas.index and m in seas.columns else 0
-                      for m in range(1,13)]
+        from copy import deepcopy
+        # Utiliser la série originale correspondante (index i+1 car ser[0]=#REF! parasite)
+        orig_ser_idx = i + 1
+        if orig_ser_idx < len(existing):
+            new_ser = deepcopy(existing[orig_ser_idx])
+        elif ref_ser is not None:
+            new_ser = deepcopy(ref_ser)
+        else:
+            new_ser = etree.SubElement(line_chart, ctag("ser"))
+
+        idx_el = new_ser.find(ctag("idx"))
+        if idx_el is None: idx_el = etree.SubElement(new_ser, ctag("idx"))
+        idx_el.set("val", str(i))
+        order_el = new_ser.find(ctag("order"))
+        if order_el is None: order_el = etree.SubElement(new_ser, ctag("order"))
+        order_el.set("val", str(i))
+
+        month_vals = [seas.loc[y, m] if y in seas.index and m in seas.columns else 0
+                      for m in range(1, 13)]
         all_vals.extend(month_vals)
-        _rebuild_cache(ser, MONTHS_FR, month_vals, divide_by=1e6)
-        _set_series_name(ser, str(int(y)))
-        _build_peak_dlbls(ser, month_vals, top_n=3)
+        _rebuild_cache(new_ser, MONTHS_FR, month_vals, divide_by=1e6)
+        _set_series_name(new_ser, str(int(y)))
+        _build_peak_dlbls(new_ser, month_vals, top_n=3)
+
+        if insert_before is not None:
+            line_chart.insert(list(line_chart).index(insert_before), new_ser)
+        else:
+            line_chart.append(new_ser)
+
     _fix_val_axis(root, smart_max(all_vals))
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
@@ -501,6 +687,7 @@ def process_chart_annonceurs(chart_xml: bytes, cats: list, vals: list, year_labe
         cats = cats[:TOP_N_ANNONCEURS]
         vals = vals[:TOP_N_ANNONCEURS]
         _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
+        _update_series_formula(sers[0], len(cats))
         _set_series_name(sers[0], year_label)
         dlbls = root.find(f".//{ctag('dLbls')}")
         if dlbls is not None:
@@ -516,6 +703,7 @@ def process_chart_media_annual(chart_xml: bytes, cats: list, vals: list, label: 
     sers = root.findall(f".//{ctag('ser')}")
     if sers:
         _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
+        _update_series_formula(sers[0], len(cats))
         _set_series_name(sers[0], label)
         dlbls = root.find(f".//{ctag('dLbls')}")
         if dlbls is not None:
@@ -533,6 +721,7 @@ def process_chart_top_ann(chart_xml: bytes, cats: list, vals: list, label: str) 
         cats = cats[:TOP_N_ANNONCEURS]
         vals = vals[:TOP_N_ANNONCEURS]
         _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
+        _update_series_formula(sers[0], len(cats))
         _set_series_name(sers[0], label)
         dlbls = root.find(f".//{ctag('dLbls')}")
         if dlbls is not None:
@@ -543,13 +732,13 @@ def process_chart_top_ann(chart_xml: bytes, cats: list, vals: list, label: str) 
 
 
 def process_chart_pie(chart_xml: bytes, cats: list, vals: list, label: str) -> bytes:
-    """Pie répartition — garder % comme dans le template."""
+    """Pie repartition — noms de supports nettoyes, % conserves."""
     root = etree.fromstring(chart_xml)
     sers = root.findall(f".//{ctag('ser')}")
     if sers:
         _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
+        _update_series_formula(sers[0], len(cats))
         _set_series_name(sers[0], label)
-        # Garder le format existant (%)
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
@@ -558,19 +747,21 @@ def process_chart_pie(chart_xml: bytes, cats: list, vals: list, label: str) -> b
 # ─────────────────────────────────────────────
 
 def _replace_tf_in_xml(txBody, new_text: str):
-    """Remplace le contenu texte d'un txBody XML."""
+    """Remplace le contenu texte d'un txBody XML en preservant la mise en forme."""
     pns = ANS
     def qtag(n): return f"{{{pns}}}{n}"
 
     font_sz = font_b = None
+    orig_rpr = None  # conserver le rPr complet (couleur incluse)
     for p in txBody.findall(qtag("p")):
         for r in p.findall(qtag("r")):
             rpr = r.find(qtag("rPr"))
             if rpr is not None:
                 font_sz = rpr.get("sz")
                 font_b  = rpr.get("b")
+                orig_rpr = deepcopy(rpr)  # copie complète avec solidFill/couleur
                 break
-        if font_sz: break
+        if orig_rpr is not None: break
 
     first_pPr = None
     paras = txBody.findall(qtag("p"))
@@ -587,10 +778,15 @@ def _replace_tf_in_xml(txBody, new_text: str):
             end.set("lang","fr-FR"); end.set("dirty","0")
             continue
         r_el  = etree.SubElement(p_el, qtag("r"))
-        rpr   = etree.SubElement(r_el, qtag("rPr"))
-        rpr.set("lang","fr-FR"); rpr.set("dirty","0")
-        if font_sz: rpr.set("sz", font_sz)
-        if font_b:  rpr.set("b", font_b)
+        if orig_rpr is not None:
+            # Réutiliser le rPr original complet (préserve la couleur)
+            rpr = deepcopy(orig_rpr)
+            r_el.append(rpr)
+        else:
+            rpr = etree.SubElement(r_el, qtag("rPr"))
+            rpr.set("lang","fr-FR"); rpr.set("dirty","0")
+            if font_sz: rpr.set("sz", font_sz)
+            if font_b:  rpr.set("b", font_b)
         t_el  = etree.SubElement(r_el, qtag("t"))
         t_el.text = line
 
@@ -747,6 +943,71 @@ def clone_media_slide(
 # 5. INJECTION PRINCIPALE
 # ─────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS: Mise à jour des fichiers Excel embarqués
+# ─────────────────────────────────────────────────────────────
+
+def _update_excel_simple(xlsx_bytes: bytes, cats: list, vals: list,
+                          col_header: str = "Valeur") -> bytes:
+    """Met a jour un Excel embarque simple: col A=categories, col B=valeurs."""
+    import openpyxl, io
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb.active
+    # Vider le contenu existant
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.value = None
+    # Header
+    ws.cell(1, 1).value = ""
+    ws.cell(1, 2).value = col_header
+    # Données
+    for i, (cat, val) in enumerate(zip(cats, vals)):
+        ws.cell(i + 2, 1).value = cat
+        ws.cell(i + 2, 2).value = val if val is not None else 0
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _update_excel_multi(xlsx_bytes: bytes, cats: list, series: dict) -> bytes:
+    """Met a jour un Excel embarque multi-series: col A=cats, B/C/D...=series."""
+    import openpyxl, io
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb.active
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.value = None
+    # Header row
+    ws.cell(1, 1).value = ""
+    for j, name in enumerate(series.keys()):
+        ws.cell(1, j + 2).value = name
+    # Data rows
+    for i, cat in enumerate(cats):
+        ws.cell(i + 2, 1).value = cat
+        for j, vals in enumerate(series.values()):
+            ws.cell(i + 2, j + 2).value = vals[i] if i < len(vals) and vals[i] is not None else 0
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _get_chart_embedding(original: dict, chart_id: int) -> tuple:
+    """Retourne (rels_path, embedding_path, embedding_bytes) pour un chart."""
+    rels_path = f"ppt/charts/_rels/chart{chart_id}.xml.rels"
+    if rels_path not in original:
+        return None, None, None
+    rels_root = etree.fromstring(original[rels_path])
+    for rel in rels_root:
+        target = rel.get("Target", "")
+        if "embedding" in target:
+            emb_name = target.split("/")[-1]
+            emb_path = f"ppt/embeddings/{emb_name}"
+            if emb_path in original:
+                return rels_path, emb_path, original[emb_path]
+    return None, None, None
+
+
 class PPTInjector:
     def __init__(self, template_path: str):
         self.template_path = template_path
@@ -758,51 +1019,42 @@ class PPTInjector:
 
         years      = calc.years
         year_last  = calc.year_last
-        year_prev  = calc.year_prev
         totals     = calc.total_by_year()
         mm         = calc.total_by_year_media()
         seas       = calc.seasonality_by_year()
         label      = sous_secteur or secteur
-        yrange     = f"{years[0]} – {year_last}" if years else ""
-        medias     = calc.medias_present  # ex: ["AF","TV","PR","RD"]
+        yrange     = f"{years[0]} \u2013 {year_last}" if years else ""
+        medias     = calc.medias_present
 
-        # ── Lire tout le ZIP en mémoire ───────────────────────────────
-        original: dict = {}
+        # Lire ZIP
+        original = {}
         with zipfile.ZipFile(io.BytesIO(self.template_bytes_raw), "r") as zin:
             for item in zin.infolist():
                 original[item.filename] = zin.read(item.filename)
 
-        # ── Préparer les mises à jour des charts statiques ────────────
-
-        # Chart1 — investissements annuels
+        # Slide 2 charts: chart1=barAnnual, chart2=lineSeas, chart3=barStacked100
         ch1 = process_chart1_annual(
             original["ppt/charts/chart1.xml"],
-            [int(y) for y in years],
-            [totals.get(y,0) for y in years]
+            [int(y) for y in years], [totals.get(y, 0) for y in years]
         )
+        ch2 = process_chart3_seasonality(original["ppt/charts/chart2.xml"], years, seas)
+        ch3 = process_chart2_stacked(original["ppt/charts/chart3.xml"], years, mm)
 
-        # Chart2 — stacked 100% par média
-        ch2 = process_chart2_stacked(original["ppt/charts/chart2.xml"], years, mm)
-
-        # Chart3 — saisonnalité mensuelle
-        ch3 = process_chart3_seasonality(original["ppt/charts/chart3.xml"], years, seas)
-
-        # Charts annonceurs slide3
-        years_ann = years[-3:] if len(years)>=3 else years  # 2023 gauche, 2024 milieu, 2025 droite
+        # Slide 3 annonceurs: chart4=2023, chart5=2024, chart6=2025
+        years_ann = years[-3:] if len(years) >= 3 else years
         ch4 = ch5 = ch6 = None
-        for i, (chart_id, y) in enumerate(zip([4,5,6], years_ann + [None]*(3-len(years_ann)))):
-            if y is None: continue
+        for chart_id, y in zip([4, 5, 6], list(years_ann) + [None] * (3 - len(years_ann))):
+            if y is None:
+                continue
             top = calc.top_annonceurs_by_year(y, n=TOP_N_ANNONCEURS)
             xml = process_chart_annonceurs(
                 original[f"ppt/charts/chart{chart_id}.xml"],
                 list(top.index), list(top.values), str(int(y))
             )
-            if chart_id==4: ch4=xml
-            elif chart_id==5: ch5=xml
-            elif chart_id==6: ch6=xml
+            if chart_id == 4:   ch4 = xml
+            elif chart_id == 5: ch5 = xml
+            elif chart_id == 6: ch6 = xml
 
-        # Charts slides médias fixes (4=OOH/AF, 5=TV, 6=RD dans template)
-        # On les traite aussi
         def make_media_charts(code, chart_annual_id, chart_pie_id, chart_ann_id):
             mt = calc.total_focus_by_year(code)
             ta = calc.top_ann_focus_last(code)
@@ -810,139 +1062,283 @@ class PPTInjector:
             media_label = MEDIA_LABELS.get(code, code)
             ch_a = process_chart_media_annual(
                 original[f"ppt/charts/chart{chart_annual_id}.xml"],
-                [int(y) for y in years], [mt.get(y,0) for y in years], media_label
+                [int(y) for y in years], [mt.get(y, 0) for y in years], media_label
             )
             ch_p = process_chart_pie(
                 original[f"ppt/charts/chart{chart_pie_id}.xml"],
-                list(ts.index), list(ts.values), MEDIA_SHORT.get(code,code)
+                list(ts.index), list(ts.values), MEDIA_SHORT.get(code, code)
             )
             ch_n = process_chart_top_ann(
                 original[f"ppt/charts/chart{chart_ann_id}.xml"],
-                list(ta.index), list(ta.values), f"Top {MEDIA_SHORT.get(code,code)}"
+                list(ta.index), list(ta.values), f"Top {MEDIA_SHORT.get(code, code)}"
             )
             return ch_a, ch_p, ch_n
 
-        # Slide4 = AF/OOH: chart7=annual, chart8=top ann, chart9=pie
+        # Slide 4: AF  — chart7=annual, chart9=pie,  chart8=topAnn
         ch7, ch9, ch8 = make_media_charts("AF", 7, 9, 8) if "AF" in medias else (
             original["ppt/charts/chart7.xml"], original["ppt/charts/chart9.xml"], original["ppt/charts/chart8.xml"])
 
-        # Slide5 = TV: chart10=annual, chart11=pie, chart12=top ann
-        ch10, ch11, ch12 = make_media_charts("TV", 10, 11, 12) if "TV" in medias else (
-            original["ppt/charts/chart10.xml"], original["ppt/charts/chart11.xml"], original["ppt/charts/chart12.xml"])
+        # Slide 5: RD  — chart12=annual, chart10=pie, chart11=topAnn
+        ch12, ch10, ch11 = make_media_charts("RD", 12, 10, 11) if "RD" in medias else (
+            original["ppt/charts/chart12.xml"], original["ppt/charts/chart10.xml"], original["ppt/charts/chart11.xml"])
 
-        # Slide6 = RD: chart15=annual, chart13=pie, chart14=top ann
-        ch15, ch13, ch14 = make_media_charts("RD", 15, 13, 14) if "RD" in medias else (
-            original["ppt/charts/chart15.xml"], original["ppt/charts/chart13.xml"], original["ppt/charts/chart14.xml"])
+        # Slide 6: TV  — chart14=annual, chart13=pie, chart15=topAnn
+        ch14, ch13, ch15 = make_media_charts("TV", 14, 13, 15) if "TV" in medias else (
+            original["ppt/charts/chart14.xml"], original["ppt/charts/chart13.xml"], original["ppt/charts/chart15.xml"])
 
-        # ── Textes slides fixes ───────────────────────────────────────
+        # Slide 7: CN  — chart16=annual, chart17=pie, chart18=topAnn
+        ch16, ch17, ch18 = make_media_charts("CN", 16, 17, 18) if "CN" in medias else (
+            original["ppt/charts/chart16.xml"], original["ppt/charts/chart17.xml"], original["ppt/charts/chart18.xml"])
+
+        # Slide 8: PR  — chart21=annual, chart19=pie, chart20=topAnn
+        ch21, ch19, ch20 = make_media_charts("PR", 21, 19, 20) if "PR" in medias else (
+            original["ppt/charts/chart21.xml"], original["ppt/charts/chart19.xml"], original["ppt/charts/chart20.xml"])
+
         slide_texts = {
             "ppt/slides/slide1.xml": {
                 "Title 1": f"Media Review\n{label}\n| {yrange}",
             },
             "ppt/slides/slide2.xml": {
-                "Text 0": f"Investissements média — {label}",
-                "Text 1": f"{yrange} | Millions MAD | Source : Imperium",
-                "Text 3": comments.get("slide2_headline","") + "\n\n" + comments.get("slide2_global",""),
+                "Text 0":    f"Investissements m\u00e9dia \u2014 {label}",
+                "Text 1":    f"{yrange} | Millions MAD | Source : Imperium",
+                "TextBox 15": comments.get("slide2_headline", "") + "\n\n" + comments.get("slide2_global", ""),
             },
             "ppt/slides/slide3.xml": {
-                "TextBox 1": f"Investissement média par annonceur — {label}",
-                "TextBox 2": f"Classement annonceurs | Millions MAD | {' - '.join(str(int(y)) for y in years[-3:])} | Source : Imperium",
-                "ZoneTexte 10": comments.get("slide3_annonceurs",""),
+                "TextBox 1":    f"Investissement m\u00e9dia par annonceur \u2014 {label}",
+                "TextBox 2":    f"Classement annonceurs | Millions MAD | {' - '.join(str(int(y)) for y in years[-3:])} | Source : Imperium",
+                "ZoneTexte 13": comments.get("slide3_annonceurs", ""),
             },
             "ppt/slides/slide4.xml": {
-                "TextBox 2": f"Investissement média AF (OOH) — {label}",
-                "TextBox 3": f"FY {yrange} | Millions MAD | Source : Imperium",
-                "TextBox 9": f"Répartition {int(year_last)} par ville",
+                "Text 0":    f"Investissements m\u00e9dia AFFICHAGE (OOH) \u2014 {label}",
+                "TextBox 3":  f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8":  "Investissements OOH (AF)",
+                "TextBox 9":  f"R\u00e9partition {int(year_last)} par ville",
                 "TextBox 10": f"Top annonceurs OOH (FY {int(year_last)})",
-                "TextBox 15": comments.get("slide_af",""),
+                "TextBox 15": comments.get("slide_af", ""),
             },
             "ppt/slides/slide5.xml": {
-                "TextBox 2": f"Investissement média TV — {label}",
-                "TextBox 3": f"FY {yrange} | Millions MAD | Source : Imperium",
-                "TextBox 8": "Investissements TV",
-                "TextBox 9": f"Répartition {int(year_last)} par support",
-                "TextBox 10": f"Top annonceurs TV (FY {int(year_last)})",
-                "TextBox 15": comments.get("slide_tv",""),
+                "Text 0":    f"Investissements m\u00e9dia RADIO \u2014 {label}",
+                "TextBox 3":  f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8":  "Investissements Radio",
+                "TextBox 9":  f"R\u00e9partition {int(year_last)} par station",
+                "TextBox 10": f"Top annonceurs RD (FY {int(year_last)})",
+                "TextBox 15": comments.get("slide_rd", ""),
             },
             "ppt/slides/slide6.xml": {
-                "TextBox 1": f"Investissement média Radio — {label}",
-                "TextBox 2": f"{yrange} | Millions MAD | Source : Imperium",
-                "TextBox 7": "Investissements Radio",
-                "TextBox 8": f"Split par station — FY {int(year_last)}",
-                "TextBox 9": f"Top annonceurs RD — FY {int(year_last)}",
-                "TextBox 14": comments.get("slide_rd",""),
+                "Text 0":    f"Investissements m\u00e9dia TV \u2014 {label}",
+                "TextBox 3":  f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8":  "Investissements T\u00e9l\u00e9",
+                "TextBox 9":  f"R\u00e9partition {int(year_last)} par cha\u00eene",
+                "TextBox 10": f"Top annonceurs TV (FY {int(year_last)})",
+                "Rectangle 3": comments.get("slide_tv", ""),
+            },
+            **({"ppt/slides/slide7.xml": {
+                "Text 0":    f"Investissements m\u00e9dia CIN\u00c9MA \u2014 {label}",
+                "TextBox 3":  f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8":  "Investissements Cin\u00e9ma",
+                "TextBox 9":  f"R\u00e9partition {int(year_last)} par support",
+                "TextBox 10": f"Top annonceurs CN (FY {int(year_last)})",
+                "TextBox 15": comments.get("slide_cn", ""),
+            }} if "CN" in medias else {}),
+            "ppt/slides/slide8.xml": {
+                "Text 0":    f"Investissements m\u00e9dia PRESSE \u2014 {label}",
+                "TextBox 3":  f"FY {yrange} | Millions MAD | Source : Imperium",
+                "TextBox 8":  "Investissements Presse",
+                "TextBox 9":  f"R\u00e9partition {int(year_last)} par support",
+                "TextBox 10": f"Top annonceurs PR (FY {int(year_last)})",
+                "TextBox 15": comments.get("slide_pr", ""),
             },
         }
 
-        # ── Slides supplémentaires pour médias hors AF/TV/RD ──────────
-        extra_medias = [m for m in medias if m not in ("AF","TV","RD")]
-        extra_files: dict = {}
-        extra_slide_ids = []  # (slide_num, slide_path)
-
-        next_slide_num = 7
-        next_chart_id  = 16
-        next_emb_id    = 15
-
-        for media_code in extra_medias:
-            cloned = clone_media_slide(
-                original, media_code, next_slide_num,
-                next_chart_id, next_emb_id,
-                calc, comments, label
-            )
-            extra_files.update(cloned)
-            extra_slide_ids.append((next_slide_num, f"ppt/slides/slide{next_slide_num}.xml"))
-            next_slide_num += 3
-            next_chart_id  += 3
-            next_emb_id    += 3
-
-        # ── Construire le nouveau ZIP ─────────────────────────────────
         chart_updates = {
-            "ppt/charts/chart1.xml": ch1,
-            "ppt/charts/chart2.xml": ch2,
-            "ppt/charts/chart3.xml": ch3,
-            "ppt/charts/chart7.xml": ch7,
-            "ppt/charts/chart8.xml": ch8,
-            "ppt/charts/chart9.xml": ch9,
+            "ppt/charts/chart1.xml":  ch1,
+            "ppt/charts/chart2.xml":  ch2,
+            "ppt/charts/chart3.xml":  ch3,
+            "ppt/charts/chart7.xml":  ch7,
+            "ppt/charts/chart8.xml":  ch8,
+            "ppt/charts/chart9.xml":  ch9,
             "ppt/charts/chart10.xml": ch10,
             "ppt/charts/chart11.xml": ch11,
             "ppt/charts/chart12.xml": ch12,
             "ppt/charts/chart13.xml": ch13,
             "ppt/charts/chart14.xml": ch14,
             "ppt/charts/chart15.xml": ch15,
+            "ppt/charts/chart16.xml": ch16,
+            "ppt/charts/chart17.xml": ch17,
+            "ppt/charts/chart18.xml": ch18,
+            "ppt/charts/chart19.xml": ch19,
+            "ppt/charts/chart20.xml": ch20,
+            "ppt/charts/chart21.xml": ch21,
         }
         if ch4: chart_updates["ppt/charts/chart4.xml"] = ch4
         if ch5: chart_updates["ppt/charts/chart5.xml"] = ch5
         if ch6: chart_updates["ppt/charts/chart6.xml"] = ch6
 
+        # ── Mise à jour des Excel embarqués ───────────────────────────
+        excel_updates = {}
+
+        def _emb(chart_id):
+            """Retourne (emb_path, emb_bytes) pour un chart."""
+            rp = f"ppt/charts/_rels/chart{chart_id}.xml.rels"
+            if rp not in original:
+                return None, None
+            rr = etree.fromstring(original[rp])
+            for rel in rr:
+                t = rel.get("Target", "")
+                if "embedding" in t:
+                    name = t.split("/")[-1]
+                    path = f"ppt/embeddings/{name}"
+                    return path, original.get(path)
+            return None, None
+
+        def _xlsx_simple(emb_bytes, cats, vals, col_header="Valeur"):
+            """Simple 2-col: A=cats, B=valeurs en millions MAD."""
+            import openpyxl as _xl, io as _io
+            wb = _xl.load_workbook(_io.BytesIO(emb_bytes))
+            ws = wb.active
+            for r in ws.iter_rows(): 
+                for c in r: c.value = None
+            ws.cell(1,1).value = ""
+            ws.cell(1,2).value = col_header
+            for i,(cat,val) in enumerate(zip(cats,vals)):
+                ws.cell(i+2,1).value = cat
+                ws.cell(i+2,2).value = round(val, 2) if val else 0
+            out = _io.BytesIO()
+            wb.save(out)
+            return out.getvalue()
+
+        def _xlsx_multi(emb_bytes, cats, series_dict):
+            """Multi-col: A=cats, B/C/D=series (valeurs en millions MAD)."""
+            import openpyxl as _xl, io as _io
+            wb = _xl.load_workbook(_io.BytesIO(emb_bytes))
+            ws = wb.active
+            for r in ws.iter_rows():
+                for c in r: c.value = None
+            ws.cell(1,1).value = ""
+            for j, name in enumerate(series_dict.keys()):
+                ws.cell(1, j+2).value = str(name)
+            for i, cat in enumerate(cats):
+                ws.cell(i+2, 1).value = cat
+                for j, vals in enumerate(series_dict.values()):
+                    v = vals[i] if i < len(vals) else 0
+                    ws.cell(i+2, j+2).value = round(v, 2) if v else 0
+            out = _io.BytesIO()
+            wb.save(out)
+            return out.getvalue()
+
+        def _xlsx_stacked(emb_bytes, cats, series_dict):
+            """Stacked: valeurs MAD brut dans Excel, graphique affiche en millions."""
+            import openpyxl as _xl, io as _io
+            wb = _xl.load_workbook(_io.BytesIO(emb_bytes))
+            ws = wb.active
+            for r in ws.iter_rows():
+                for c in r: c.value = None
+            ws.cell(1,1).value = "Colonne1"
+            for j, name in enumerate(series_dict.keys()):
+                ws.cell(1, j+2).value = name
+            for i, cat in enumerate(cats):
+                ws.cell(i+2, 1).value = cat
+                for j, (name, vals) in enumerate(series_dict.items()):
+                    v = vals[i] if i < len(vals) else 0
+                    ws.cell(i+2, j+2).value = round(v or 0, 2)  # MAD brut
+            out = _io.BytesIO()
+            wb.save(out)
+            return out.getvalue()
+
+        # chart1: annual total
+        p, b = _emb(1)
+        if p and b:
+            excel_updates[p] = _xlsx_simple(b,
+                [int(y) for y in years], [totals.get(y,0) for y in years], "Total")
+
+        # chart2: seasonality multi-year
+        p, b = _emb(2)
+        if p and b:
+            month_data = {str(int(y)): [seas.loc[y, m] if y in seas.index and m in seas.columns else 0
+                                        for m in range(1, 13)]
+                          for y in years}
+            excel_updates[p] = _xlsx_multi(b, MONTHS_FR, month_data)
+
+        # chart3: stacked répartition (proportions)
+        p, b = _emb(3)
+        if p and b:
+            media_present = [m for m in ["AF","PR","RD","TV","CN"]
+                             if m in mm.columns and mm[m].sum() > 0]
+            stacked_data = {m: [mm.loc[y,m] if y in mm.index else 0 for y in years]
+                            for m in media_present}
+            excel_updates[p] = _xlsx_stacked(b, [int(y) for y in years], stacked_data)
+
+        # chart4/5/6: annonceurs par année
+        for chart_id, y in zip([4,5,6], list(years_ann) + [None]*(3-len(years_ann))):
+            if y is None: continue
+            p, b = _emb(chart_id)
+            if p and b:
+                top = calc.top_annonceurs_by_year(y, n=TOP_N_ANNONCEURS)
+                excel_updates[p] = _xlsx_simple(b,
+                    list(top.index), list(top.values), str(int(y)))
+
+        # Slides médias: helper
+        def _excel_media(code, cid_annual, cid_pie, cid_topann):
+            mt = calc.total_focus_by_year(code)
+            ta = calc.top_ann_focus_last(code)
+            ts = calc.split_support_last(code)
+            label = MEDIA_SHORT.get(code, code)
+            p, b = _emb(cid_annual)
+            if p and b:
+                excel_updates[p] = _xlsx_simple(b,
+                    [int(y) for y in years], [mt.get(y,0) for y in years], label)
+            p, b = _emb(cid_pie)
+            if p and b:
+                excel_updates[p] = _xlsx_simple(b,
+                    list(ts.index), list(ts.values), label)
+            p, b = _emb(cid_topann)
+            if p and b:
+                excel_updates[p] = _xlsx_simple(b,
+                    list(ta.index), list(ta.values), label)
+
+        # AF: chart7=annual, chart9=pie, chart8=topAnn
+        if "AF" in medias: _excel_media("AF", 7, 9, 8)
+        # RD: chart12=annual, chart10=pie, chart11=topAnn
+        if "RD" in medias: _excel_media("RD", 12, 10, 11)
+        # TV: chart14=annual, chart13=pie, chart15=topAnn
+        if "TV" in medias: _excel_media("TV", 14, 13, 15)
+        # CN: chart16=annual, chart17=pie, chart18=topAnn
+        if "CN" in medias: _excel_media("CN", 16, 17, 18)
+        # PR: chart21=annual, chart19=pie, chart20=topAnn
+        if "PR" in medias: _excel_media("PR", 21, 19, 20)
+
+        # Slides à exclure si média absent
+        slides_to_skip = set()
+        if "CN" not in medias:
+            slides_to_skip.add("ppt/slides/slide7.xml")
+            slides_to_skip.add("ppt/slides/_rels/slide7.xml.rels")
+            for cid in [16, 17, 18]:
+                slides_to_skip.add(f"ppt/charts/chart{cid}.xml")
+
         out_zip = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(self.template_bytes_raw), "r") as zin:
             with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
+                    if item.filename in slides_to_skip:
+                        continue
                     data = zin.read(item.filename)
-
                     if item.filename in chart_updates:
                         data = chart_updates[item.filename]
                     elif item.filename in slide_texts:
-                        try: data = update_slide_texts(data, slide_texts[item.filename])
-                        except: pass
-
-                    # Mettre à jour presentation.xml si slides extra
-                    elif item.filename == "ppt/presentation.xml" and extra_slide_ids:
-                        data = _add_slides_to_presentation(data, extra_slide_ids)
-
-                    # Mettre à jour [Content_Types].xml si slides extra
-                    elif item.filename == "[Content_Types].xml" and extra_slide_ids:
-                        data = _add_content_types(data, extra_slide_ids)
-
-                    # Mettre à jour ppt/_rels/presentation.xml.rels si slides extra
-                    elif item.filename == "ppt/_rels/presentation.xml.rels" and extra_slide_ids:
-                        data = _add_prs_rels(data, extra_slide_ids)
-
+                        try:
+                            data = update_slide_texts(data, slide_texts[item.filename])
+                        except:
+                            pass
+                    elif item.filename == "ppt/presentation.xml" and slides_to_skip:
+                        data = _remove_slides_from_presentation(data, slides_to_skip,
+                                                          original.get("ppt/_rels/presentation.xml.rels"))
+                    elif item.filename == "[Content_Types].xml" and slides_to_skip:
+                        data = _remove_content_types(data, slides_to_skip)
+                    elif item.filename == "ppt/_rels/presentation.xml.rels" and slides_to_skip:
+                        data = _remove_prs_rels(data, slides_to_skip)
+                    elif item.filename in excel_updates:
+                        data = excel_updates[item.filename]
                     zout.writestr(item, data)
-
-                # Ajouter les nouveaux fichiers (slides extra + leurs charts + rels)
-                for path, content in extra_files.items():
-                    zout.writestr(path, content)
 
         return out_zip.getvalue()
 
@@ -992,4 +1388,62 @@ def _add_prs_rels(rels_xml: bytes, extra_slide_ids: list) -> bytes:
         rel.set("Id", rid)
         rel.set("Type", SLIDE_TYPE)
         rel.set("Target", slide_path.replace("ppt/",""))
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+def _remove_slides_from_presentation(prs_xml: bytes, slides_to_skip: set,
+                                      prs_rels_xml: bytes = None) -> bytes:
+    """Supprime les sldId de presentation.xml pour les slides exclues."""
+    root = etree.fromstring(prs_xml)
+    PRS_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    R_NS   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    # Construire mapping rId → target depuis les rels
+    rid_to_target = {}
+    if prs_rels_xml:
+        rels_root = etree.fromstring(prs_rels_xml)
+        for rel in rels_root:
+            target = rel.get("Target", "")
+            full = f"ppt/{target}" if not target.startswith("ppt") else target
+            rid_to_target[rel.get("Id", "")] = full
+
+    # Trouver les rIds à supprimer
+    rids_to_remove = set()
+    for rid, full_path in rid_to_target.items():
+        if full_path in slides_to_skip:
+            rids_to_remove.add(rid)
+
+    # Supprimer les sldId correspondants dans sldIdLst
+    for sldIdLst in root.findall(f".//{{{PRS_NS}}}sldIdLst"):
+        for sldId in list(sldIdLst):
+            rid = sldId.get(f"{{{R_NS}}}id", "")
+            if rid in rids_to_remove:
+                sldIdLst.remove(sldId)
+
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _remove_content_types(ct_xml: bytes, slides_to_skip: set) -> bytes:
+    """Supprime les entrées [Content_Types].xml pour les slides exclues."""
+    root = etree.fromstring(ct_xml)
+    CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+    for override in list(root.findall(f"{{{CT_NS}}}Override")):
+        part = override.get("PartName", "")
+        # /ppt/slides/slide7.xml → ppt/slides/slide7.xml
+        part_clean = part.lstrip("/")
+        if part_clean in slides_to_skip:
+            root.remove(override)
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _remove_prs_rels(rels_xml: bytes, slides_to_skip: set) -> bytes:
+    """Supprime les relations dans presentation.xml.rels pour les slides exclues."""
+    root = etree.fromstring(rels_xml)
+    RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    for rel in list(root):
+        target = rel.get("Target", "")
+        # slides/slide7.xml → ppt/slides/slide7.xml
+        full_path = f"ppt/{target}" if not target.startswith("ppt") else target
+        if full_path in slides_to_skip:
+            root.remove(rel)
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
