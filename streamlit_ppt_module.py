@@ -45,6 +45,9 @@ def find_templates() -> dict[str, str]:
 
 def render_ppt_module():
     """Affiche le module PPT. Appelable depuis app.py."""
+    if not _ppt_engine_ok:
+        st.error("ppt_engine.py introuvable. Vérifiez que le fichier est bien dans le repo GitHub.")
+        return
 
     st.header("📊 Générateur Media Review PPT")
     st.caption("Uploadez votre DATA brute et obtenez un PPT finalisé avec graphiques et commentaires IA.")
