@@ -60,23 +60,14 @@ def render_ppt_module():
     st.divider()
 
     # ── Étape 1 : Upload DATA ─────────────────────────────────────────
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.markdown("**1) Uploader la DATA brute (Excel)**")
-        data_file = st.file_uploader(
-            "Fichier Excel Imperium",
-            type=["xlsx", "csv"],
-            key="ppt_data_upload",
-            label_visibility="collapsed",
-        )
-    with col2:
-        st.markdown("**2) Template PPT**")
-        template_file = st.file_uploader(
-            "Template .pptx",
-            type=["pptx"],
-            key="ppt_template_upload",
-            label_visibility="collapsed",
-        )
+    st.markdown("**1) Uploader la DATA brute (Excel)**")
+    data_file = st.file_uploader(
+        "Fichier Excel Imperium",
+        type=["xlsx", "csv"],
+        key="ppt_data_upload",
+        label_visibility="collapsed",
+    )
+    template_file = None  # template auto-détecté depuis le repo
 
     # ── Chargement DATA ───────────────────────────────────────────────
     df_raw = None
@@ -133,28 +124,22 @@ def render_ppt_module():
             except Exception as e:
                 st.warning(f"Aperçu non disponible : {e}")
 
-        # ── Template ──────────────────────────────────────────────────
+        # ── Template — auto-détection depuis le repo ─────────────────
         template_path = None
-        if template_file:
-            # Sauvegarder temp
-            tmp_path = APP_DIR / f"_tmp_template_{template_file.name}"
-            with open(tmp_path, "wb") as f:
-                f.write(template_file.read())
-            template_path = str(tmp_path)
-            st.success(f"✅ Template : {template_file.name}")
-        else:
-            # Chercher un template par défaut dans le dossier
-            templates = find_templates()
-            if templates:
+        templates = find_templates()
+        if templates:
+            # Prendre le premier template trouvé (ou laisser choisir si plusieurs)
+            if len(templates) == 1:
+                template_path = list(templates.values())[0]
+            else:
                 default_tpl = st.selectbox(
-                    "Ou choisir un template existant",
+                    "Template PPT",
                     list(templates.keys()),
                     key="ppt_tpl_select"
                 )
                 template_path = templates[default_tpl]
-                st.info(f"Template sélectionné : {default_tpl}")
-            else:
-                st.warning("Aucun template .pptx trouvé. Uploadez-en un ci-dessus.")
+        else:
+            st.warning("⚠️ Aucun template .pptx trouvé dans le repo. Ajoutez-en un sur GitHub.")
 
         # ── Bouton Génération ─────────────────────────────────────────
         st.divider()
@@ -191,13 +176,6 @@ def render_ppt_module():
                     pptx_bytes = injector.generate(calc, comments, secteur_sel, label)
 
                     progress.progress(100, text="✅ Terminé !")
-
-                    # Nettoyer temp
-                    if template_file and Path(str(template_path)).name.startswith("_tmp_"):
-                        try:
-                            os.remove(template_path)
-                        except:
-                            pass
 
                     # ── Résultat ─────────────────────────────────────
                     st.success("✅ Media Review généré avec succès !")
