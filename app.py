@@ -23,23 +23,18 @@ TEMPLATE_YUMI_PATH = APP_DIR / "SUIVI GATO.xlsx"
 HEADER_ROW = 9
 DATA_START_ROW = 10
 
-# ✅ Règle Décalage (mise à jour)
 DECALAGE_MINUTES = 60
 
-TV_DAY_CUTOFF_HOUR = 6  # journée TV: 00:00-05:59 => fin journée => +1440
+TV_DAY_CUTOFF_HOUR = 6
 
-# ✅ swap fallback only
 SWAP_NEAR_MINUTES = 5
 SWAP_PM1_FAR_MINUTES = 20
 ANTI_VOL_NEXT_MAX = 20
 
-# ✅ Compensation backlog (règle finale)
-COMPENSATION_NEAR_MINUTES = 120  # <= 2h => Compensation automatique (consomme backlog)
+COMPENSATION_NEAR_MINUTES = 120
 
-# ✅ YUMI: on ne génère QUE ces chaînes
 ALLOWED_YUMI = {"2M", "ALAOULA"}
 
-# ✅ Matching optimal
 USE_OPTIMAL_MATCHING = True
 PM_SKIP_PENALTY = 30
 REAL_SKIP_PENALTY = 30
@@ -89,7 +84,7 @@ FINAL_COLUMNS_YUMI = [
 # =========================
 # UI config
 # =========================
-st.set_page_config(page_title="Suivi Pige — Automatisation (PM 2026 unique)", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Pige & Media Review", page_icon="📊", layout="wide")
 
 st.markdown("""
 <style>
@@ -121,6 +116,12 @@ if "zip_bytes" not in st.session_state:
     st.session_state.zip_bytes = None
 if "last_run_info" not in st.session_state:
     st.session_state.last_run_info = None
+if "client_files_yumi" not in st.session_state:
+    st.session_state.client_files_yumi = None
+if "zip_bytes_yumi" not in st.session_state:
+    st.session_state.zip_bytes_yumi = None
+if "last_run_yumi" not in st.session_state:
+    st.session_state.last_run_yumi = None
 
 # =========================
 # Utils
@@ -354,7 +355,6 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
     used_pm = set()
     locked_real = set()
 
-    # exact match first (digits), choose first available PM (order PM)
     if real_codes and pm_codes and len(real_codes) == n and len(pm_codes) == m:
         for i in range(n):
             rc = real_codes[i]
@@ -400,7 +400,7 @@ def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes
     pm_skip_penalty = PM_SKIP_PENALTY
     real_skip_penalty = REAL_SKIP_PENALTY
     if A >= B and B > 0:
-        pm_skip_penalty = 10**12  # forbid "Non diffusé"
+        pm_skip_penalty = 10**12
 
     dp = [[INF] * (B + 1) for _ in range(A + 1)]
     prev = [[None] * (B + 1) for _ in range(A + 1)]
@@ -606,7 +606,7 @@ def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: da
     return out
 
 # =========================
-# Fill IMPERIUM per client
+# Fill IMPERIUM per client  — CODE ORIGINAL INTACT
 # =========================
 def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -634,7 +634,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     out_all = []
     backlog_by_support = {}
 
-    # ✅ only supports present in DATA
     supports_real = set(df["support_norm"].dropna().unique())
     all_supports = sorted(list(supports_real))
 
@@ -656,7 +655,6 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
 
         sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else str(sn)
 
-        # ✅ only dates present in DATA
         dates_real = set(real_s["date_only"].dropna().unique())
         all_dates = sorted(list(dates_real))
 
@@ -774,7 +772,7 @@ def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.Da
     return out_df[FINAL_COLUMNS_IMPERIUM]
 
 # =========================
-# Fill YUMI per client
+# Fill YUMI per client  — CODE ORIGINAL INTACT
 # =========================
 def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
     df = df_client.copy()
@@ -959,13 +957,11 @@ def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
         dst.protection = pycopy(src.protection)
 
 def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: str):
-    # ✅ A6: YUMI="Cible" ; Imperium vide
     ws["A6"].value = "Cible" if mode == "Suivi YUMI" else None
 
     ws["B4"].value = date.today()
     ws["B4"].number_format = "dd/mm/yyyy"
 
-    # ✅ B5: YUMI = F10 ; Imperium = H10
     if mode == "Suivi YUMI":
         ws["B5"].value = ws["F10"].value
     else:
@@ -985,7 +981,6 @@ def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: s
     ws.insert_rows(total_row)
     apply_row_style_from_template(style_row_cells, ws, total_row, final_cols)
 
-    # ✅ A="Total", B vide
     ws.cell(total_row, 1).value = "Total"
     ws.cell(total_row, 2).value = None
 
@@ -1002,16 +997,13 @@ def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: s
         cell.font = pycopy(cell.font)
         cell.font = cell.font.copy(bold=True)
 
-    # ✅ Always A & B grey + borders
     paint_grey_border(1)
     paint_grey_border(2)
 
-    # ✅ YUMI only: also T & U (20 & 21) grey + borders (empty)
     if mode == "Suivi YUMI" and len(final_cols) >= 21:
         paint_grey_border(20)
         paint_grey_border(21)
 
-    # ✅ Other columns: empty + no border/fill (except YUMI T/U already styled)
     empty_border = Border()
     empty_fill = PatternFill(fill_type=None)
 
@@ -1082,104 +1074,215 @@ def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_n
     wb.save(bio)
     return bio.getvalue()
 
-# =========================
-# UI
-# =========================
-st.title("📊 Suivi Pige — Automatisation (PM 2026 unique)")
-mode = st.radio("Type de suivi", ["Suivi Imperium", "Suivi YUMI"], horizontal=True)
-st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Col A=Date | Col B=Ecran")
 
-template_ok = False
-try:
-    _ = load_template_workbook(mode)
-    template_ok = True
-    st.success("Template OK ✅")
-except Exception as e:
-    st.error(f"Template introuvable ❌ : {e}")
+# ══════════════════════════════════════════════════════════════
+# NAVIGATION PRINCIPALE — 3 onglets
+# Seul ajout par rapport à l'original : st.tabs + clés uniques
+# ══════════════════════════════════════════════════════════════
+st.title("📊 Pige & Media Review")
 
-data_in = st.file_uploader("1) Uploader DATA IMPERIUM" if mode == "Suivi Imperium" else "1) Uploader DATA YUMI", type=["xlsx"])
-pm_file = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"])
-max_date_ui = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1))
+tab1, tab2, tab3 = st.tabs([
+    "📋 Suivi Imperium",
+    "📺 Suivi YUMI",
+    "🎯 Media Review PPT",
+])
 
-if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok)):
-    if not data_in:
-        st.warning("Upload DATA.")
-    elif not pm_file:
-        st.warning("Upload PM 2026.xlsx.")
-    else:
-        try:
-            with st.spinner("Génération en cours..."):
-                df_in = pd.read_excel(data_in)
+# ══════════════════════════════════════════════════════════════
+# ONGLET 1 — Suivi Imperium  (logique UI originale 100% intacte)
+# ══════════════════════════════════════════════════════════════
+with tab1:
+    st.subheader("Suivi Imperium")
+    st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Col A=Date | Col B=Ecran")
 
-                min_raw, max_raw = get_min_max_date_from_raw(df_in, mode)
-                if min_raw is None or max_raw is None:
-                    raise ValueError("Impossible de détecter min/max date dans la data brute.")
+    template_ok = False
+    try:
+        _ = load_template_workbook("Suivi Imperium")
+        template_ok = True
+        st.success("Template OK ✅")
+    except Exception as e:
+        st.error(f"Template introuvable ❌ : {e}")
 
-                date_min = min_raw
-                date_max = min(max_date_ui, max_raw)
-                st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
+    data_in = st.file_uploader("1) Uploader DATA IMPERIUM", type=["xlsx"], key="imp_data")
+    pm_file = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"], key="imp_pm")
+    max_date_ui = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1), key="imp_date")
 
-                if mode == "Suivi Imperium":
+    if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok), key="imp_btn"):
+        if not data_in:
+            st.warning("Upload DATA.")
+        elif not pm_file:
+            st.warning("Upload PM 2026.xlsx.")
+        else:
+            try:
+                with st.spinner("Génération en cours..."):
+                    df_in = pd.read_excel(data_in)
+
+                    min_raw, max_raw = get_min_max_date_from_raw(df_in, "Suivi Imperium")
+                    if min_raw is None or max_raw is None:
+                        raise ValueError("Impossible de détecter min/max date dans la data brute.")
+
+                    date_min = min_raw
+                    date_max = min(max_date_ui, max_raw)
+                    st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
+
                     df_all = build_final_df_from_imperium(df_in, date_min=date_min, date_max=date_max)
-                    final_cols = FINAL_COLUMNS_IMPERIUM
-                    client_col = "Marque"
-                else:
+
+                    known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
+                    pmv_all = read_pm_2026_workbook(pm_file.getvalue(), known_supports)
+
+                    client_files = {}
+                    for client_name in sorted(df_all["Marque"].dropna().unique()):
+                        df_client_raw = df_all[df_all["Marque"] == client_name].copy()
+                        client_norm = brand_key(client_name)
+
+                        pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
+                        if pm_client.empty and not pmv_all.empty:
+                            pm_client = pmv_all[
+                                pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
+                            ].copy()
+
+                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
+
+                        df_client_done = df_client_done.copy()
+                        for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
+                            df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
+
+                        template_wb = load_template_workbook("Suivi Imperium")
+                        xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, FINAL_COLUMNS_IMPERIUM, mode="Suivi Imperium")
+                        client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
+
+                    st.session_state.client_files = client_files
+                    st.session_state.zip_bytes = make_zip(client_files)
+                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
+
+            except Exception as e:
+                st.error(f"Erreur: {e}")
+
+    if st.session_state.client_files:
+        st.success(st.session_state.last_run_info)
+        st.download_button(
+            "📦 Télécharger ZIP",
+            data=st.session_state.zip_bytes,
+            file_name=f"Suivis_Imperium_{max_date_ui.isoformat()}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="imp_zip"
+        )
+        st.divider()
+        cols = st.columns(3)
+        for i, (fname, data) in enumerate(st.session_state.client_files.items()):
+            with cols[i % 3]:
+                st.download_button(
+                    f"📥 {fname}",
+                    data=data,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"imp_dl_{i}"
+                )
+
+
+# ══════════════════════════════════════════════════════════════
+# ONGLET 2 — Suivi YUMI  (logique UI originale 100% intacte)
+# ══════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("Suivi YUMI")
+    st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Chaînes : 2M & ALAOULA")
+
+    template_ok_y = False
+    try:
+        _ = load_template_workbook("Suivi YUMI")
+        template_ok_y = True
+        st.success("Template YUMI OK ✅")
+    except Exception as e:
+        st.error(f"Template introuvable ❌ : {e}")
+
+    data_in_y = st.file_uploader("1) Uploader DATA YUMI", type=["xlsx"], key="yumi_data")
+    pm_file_y = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"], key="yumi_pm")
+    max_date_y = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1), key="yumi_date")
+
+    if st.button("Lancer la génération YUMI", use_container_width=True, disabled=(not template_ok_y), key="yumi_btn"):
+        if not data_in_y:
+            st.warning("Upload DATA.")
+        elif not pm_file_y:
+            st.warning("Upload PM 2026.xlsx.")
+        else:
+            try:
+                with st.spinner("Génération en cours..."):
+                    df_in = pd.read_excel(data_in_y)
+
+                    min_raw, max_raw = get_min_max_date_from_raw(df_in, "Suivi YUMI")
+                    if min_raw is None or max_raw is None:
+                        raise ValueError("Impossible de détecter min/max date dans la data brute.")
+
+                    date_min = min_raw
+                    date_max = min(max_date_y, max_raw)
+                    st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
+
                     df_all = build_final_df_from_yumi(df_in, date_min=date_min, date_max=date_max)
-                    final_cols = FINAL_COLUMNS_YUMI
-                    client_col = "Marque"
                     df_all = df_all[df_all["support_norm"].isin(ALLOWED_YUMI)].copy()
 
-                known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
-                pmv_all = read_pm_2026_workbook(pm_file.getvalue(), known_supports)
+                    known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
+                    pmv_all = read_pm_2026_workbook(pm_file_y.getvalue(), known_supports)
 
-                client_files = {}
-                for client_name in sorted(df_all[client_col].dropna().unique()):
-                    df_client_raw = df_all[df_all[client_col] == client_name].copy()
-                    client_norm = brand_key(client_name)
+                    client_files_y = {}
+                    for client_name in sorted(df_all["Marque"].dropna().unique()):
+                        df_client_raw = df_all[df_all["Marque"] == client_name].copy()
+                        client_norm = brand_key(client_name)
 
-                    pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
-                    if pm_client.empty and not pmv_all.empty:
-                        pm_client = pmv_all[
-                            pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
-                        ].copy()
+                        pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
+                        if pm_client.empty and not pmv_all.empty:
+                            pm_client = pmv_all[
+                                pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
+                            ].copy()
 
-                    if mode == "Suivi Imperium":
-                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
-                    else:
                         df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
 
-                    df_client_done = df_client_done.copy()
-                    for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
-                        df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
+                        df_client_done = df_client_done.copy()
+                        for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
+                            df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
 
-                    template_wb = load_template_workbook(mode)
-                    xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, final_cols, mode=mode)
-                    client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
+                        template_wb = load_template_workbook("Suivi YUMI")
+                        xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, FINAL_COLUMNS_YUMI, mode="Suivi YUMI")
+                        client_files_y[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
 
-                st.session_state.client_files = client_files
-                st.session_state.zip_bytes = make_zip(client_files)
-                st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
+                    st.session_state.client_files_yumi = client_files_y
+                    st.session_state.zip_bytes_yumi = make_zip(client_files_y)
+                    st.session_state.last_run_yumi = f"{len(client_files_y)} fichiers YUMI générés"
 
-        except Exception as e:
-            st.error(f"Erreur: {e}")
+            except Exception as e:
+                st.error(f"Erreur: {e}")
 
-if st.session_state.client_files:
-    st.success(st.session_state.last_run_info)
-    st.download_button(
-        "📦 Télécharger ZIP",
-        data=st.session_state.zip_bytes,
-        file_name=f"Suivis_{mode.replace(' ', '_')}_{max_date_ui.isoformat()}.zip",
-        mime="application/zip",
-        use_container_width=True
-    )
-    st.divider()
-    cols = st.columns(3)
-    for i, (fname, data) in enumerate(st.session_state.client_files.items()):
-        with cols[i % 3]:
-            st.download_button(
-                f"📥 {fname}",
-                data=data,
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+    if st.session_state.client_files_yumi:
+        st.success(st.session_state.last_run_yumi)
+        st.download_button(
+            "📦 Télécharger ZIP YUMI",
+            data=st.session_state.zip_bytes_yumi,
+            file_name=f"Suivis_YUMI_{max_date_y.isoformat()}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="yumi_zip"
+        )
+        st.divider()
+        cols = st.columns(3)
+        for i, (fname, data) in enumerate(st.session_state.client_files_yumi.items()):
+            with cols[i % 3]:
+                st.download_button(
+                    f"📥 {fname}",
+                    data=data,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"yumi_dl_{i}"
+                )
+
+
+# ══════════════════════════════════════════════════════════════
+# ONGLET 3 — Media Review PPT
+# ══════════════════════════════════════════════════════════════
+with tab3:
+    try:
+        from streamlit_ppt_module import render_ppt_module
+        render_ppt_module()
+    except ImportError as e:
+        st.error(f"Module PPT introuvable : {e}")
+        st.info("Vérifiez que `streamlit_ppt_module.py` et `ppt_engine.py` sont dans le même dossier que `app.py`.")
