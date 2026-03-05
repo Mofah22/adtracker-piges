@@ -19,12 +19,13 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-# Import du moteur
+# Import du moteur — fait au niveau module mais sans st.stop() au top level
+_ppt_engine_ok = False
 try:
     from ppt_engine import MediaCalculator
+    _ppt_engine_ok = True
 except ImportError:
-    st.error("ppt_engine.py introuvable. Placez-le dans le même répertoire.")
-    st.stop()
+    pass
 
 # ─────────────────────────────────────────────
 # CONFIG
