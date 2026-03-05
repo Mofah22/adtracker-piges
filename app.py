@@ -1,995 +1,1288 @@
-"""
-PPT Media Review Engine v3
-===========================
-Nouveautés vs v2 :
-- Unités en millions sur tous les graphiques de valeur
-- Étiquettes % sur le graphique répartition par média (stacked 100%)
-- Saisonnalité : étiquettes uniquement sur les 3 pics par année
-- Top annonceurs : max 15, format millions
-- Slides dynamiques : une slide par média présent (AF, TV, PR, RD, CN)
-  → clonage complet des charts + rels + slide XML
-"""
-
 import io
-import zipfile
 import re
-import copy
+import zipfile
+import unicodedata
+from datetime import datetime, date, time, timedelta
 from pathlib import Path
-from typing import Optional
-from copy import deepcopy
 
 import pandas as pd
-from lxml import etree
+import streamlit as st
+import openpyxl
+from copy import copy as pycopy
 
-# ─────────────────────────────────────────────
-# NAMESPACES
-# ─────────────────────────────────────────────
-CNS  = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-ANS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
-PNS  = "http://schemas.openxmlformats.org/presentationml/2006/main"
-RNS  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-PKNS = "http://schemas.openxmlformats.org/package/2006/relationships"
-CTNS = "http://schemas.openxmlformats.org/package/2006/content-types"
+from openpyxl.styles import PatternFill, Border, Side
 
-def ctag(n): return f"{{{CNS}}}{n}"
-def atag(n): return f"{{{ANS}}}{n}"
-def ptag(n): return f"{{{PNS}}}{n}"
-def rstag(n): return f"{{{RNS}}}{n}"
+# =========================
+# CONFIG (2 modes)
+# =========================
+APP_DIR = Path(__file__).resolve().parent
 
-# ─────────────────────────────────────────────
-# CONSTANTES
-# ─────────────────────────────────────────────
-MEDIA_LABELS = {
-    "AF": "Affichage (OOH)",
-    "TV": "TV",
-    "PR": "Presse",
-    "RD": "Radio",
-    "CN": "Cinéma",
+TEMPLATE_IMPERIUM_PATH = APP_DIR / "TEMPLATE_SUIVI_FINAL.xlsx"
+TEMPLATE_YUMI_PATH = APP_DIR / "SUIVI GATO.xlsx"
+
+HEADER_ROW = 9
+DATA_START_ROW = 10
+
+DECALAGE_MINUTES = 60
+
+TV_DAY_CUTOFF_HOUR = 6
+
+SWAP_NEAR_MINUTES = 5
+SWAP_PM1_FAR_MINUTES = 20
+ANTI_VOL_NEXT_MAX = 20
+
+COMPENSATION_NEAR_MINUTES = 120
+
+ALLOWED_YUMI = {"2M", "ALAOULA"}
+
+USE_OPTIMAL_MATCHING = True
+PM_SKIP_PENALTY = 30
+REAL_SKIP_PENALTY = 30
+HARD_MAX_MATCH = 180
+
+FINAL_COLUMNS_IMPERIUM = [
+    "datep",
+    "supportp",
+    "heure de diffusion",
+    "Code PM",
+    "Commentaire",
+    "Message",
+    "Produit",
+    "Marque",
+    "RaisonSociale",
+    "FormatSec",
+    "Avant",
+    "Apres",
+    "rangE",
+    "encombE",
+]
+
+FINAL_COLUMNS_YUMI = [
+    "Date",
+    "Chaîne",
+    "N° Mois",
+    "Année",
+    "Annonceur",
+    "Marque",
+    "Produit",
+    "H.Début",
+    "H.Fin",
+    "Durée",
+    "Code Ecran",
+    "Code Ecran PM",
+    "Commentaire",
+    "Programme après",
+    "Programme avant",
+    "Position",
+    "Rang",
+    "Encombrement",
+    "Storyboard",
+    "TM%",
+    "TME",
+]
+
+# =========================
+# UI config
+# =========================
+st.set_page_config(page_title="Pige & Media Review", page_icon="📊", layout="wide")
+
+st.markdown("""
+<style>
+.main { background-color: #f8fafc; }
+.stButton>button {
+    width: 100%;
+    border-radius: 8px;
+    height: 3.5em;
+    background-color: #7289DA;
+    color: white;
+    font-weight: bold;
+    border: none;
 }
-MEDIA_SHORT = {"AF": "OOH", "TV": "TV", "PR": "PR", "RD": "RD", "CN": "CN"}
-MONTHS_FR = ["Jan","Fév","Mar","Avr","Mai","Juin","Juil","Août","Sep","Oct","Nov","Déc"]
-TOP_N_ANNONCEURS = 15
-TOP_N_SUPPORT    = 12
+.stDownloadButton>button {
+    width: 100%;
+    border-radius: 8px;
+    background-color: #43b581 !important;
+    color: white !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# Format étiquettes millions
-FMT_MILLIONS = "0.0"     # valeurs déjà en millions dans le cache
-FMT_PERCENT  = '0%'
+# =========================
+# STATE
+# =========================
+if "client_files" not in st.session_state:
+    st.session_state.client_files = None
+if "zip_bytes" not in st.session_state:
+    st.session_state.zip_bytes = None
+if "last_run_info" not in st.session_state:
+    st.session_state.last_run_info = None
+if "client_files_yumi" not in st.session_state:
+    st.session_state.client_files_yumi = None
+if "zip_bytes_yumi" not in st.session_state:
+    st.session_state.zip_bytes_yumi = None
+if "last_run_yumi" not in st.session_state:
+    st.session_state.last_run_yumi = None
 
+# =========================
+# Utils
+# =========================
+def norm_txt(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.upper()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# ─────────────────────────────────────────────
-# 1. MOTEUR DE CALCUL
-# ─────────────────────────────────────────────
-class MediaCalculator:
-    def __init__(self, df: pd.DataFrame, secteur_filter: str, sous_secteur_filter: Optional[str]):
-        self.raw = df.copy()
-        self.raw.columns = [c.strip() for c in self.raw.columns]
-        tarif_col = next((c for c in self.raw.columns if "tarif" in c.lower()), None)
-        if not tarif_col:
-            raise ValueError("Colonne tarif introuvable.")
-        self.raw.rename(columns={tarif_col: "tarif"}, inplace=True)
-        self.raw["tarif"] = pd.to_numeric(self.raw["tarif"], errors="coerce").fillna(0)
+def normalize_brand(name: str) -> str:
+    s = norm_txt(name)
+    s = re.sub(r"\bPM\b", " ", s)
+    s = re.sub(r"\bRAMADAN\b", " ", s)
+    s = re.sub(r"\bTV\b|\bRADIO\b|\bOOH\b", " ", s)
+    s = re.sub(r"\bV\d+\b", " ", s)
+    s = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", s)
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-        df_f = self.raw.copy()
-        if secteur_filter:
-            df_f = df_f[df_f["Secteur"].str.strip() == secteur_filter.strip()]
-        if sous_secteur_filter:
-            df_f = df_f[df_f["SousSecteur"].str.strip() == sous_secteur_filter.strip()]
-        self.df = df_f.copy()
+def brand_key(name: str) -> str:
+    return normalize_brand(name).replace(" ", "")
 
-        self.years     = sorted(self.df["Anp"].dropna().unique().tolist())
-        self.year_last = self.years[-1] if self.years else None
-        self.year_prev = self.years[-2] if len(self.years) >= 2 else None
-        self.year_prev2= self.years[-3] if len(self.years) >= 3 else None
+def normalize_support(sup: str) -> str:
+    s = norm_txt(sup)
+    s = s.replace(" ", "")
+    s = re.sub(r"[^A-Z0-9]+", "", s)
+    s = s.replace("TV", "")
+    if s in ("AOULA", "ALAOUOLA", "ALAOULA"):
+        return "ALAOULA"
+    return s
 
-        # Médias présents avec investissement > 0
-        self.medias_present = sorted([
-            m for m in ["AF","TV","PR","RD","CN"]
-            if self.df[self.df["media"]==m]["tarif"].sum() > 0
-        ])
+def safe_sheet_name(s: str) -> str:
+    s = re.sub(r"[:\\/*?\[\]]", " ", str(s))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:31] if len(s) > 31 else s
 
-    def total_by_year(self) -> dict:
-        return self.df.groupby("Anp")["tarif"].sum().reindex(self.years, fill_value=0).to_dict()
+def find_column(df: pd.DataFrame, candidates: list):
+    cols = {c: norm_txt(c) for c in df.columns}
+    for c, cn in cols.items():
+        for cand in candidates:
+            if norm_txt(cand) in cn:
+                return c
+    return None
 
-    def total_by_year_media(self) -> pd.DataFrame:
-        pt = self.df.groupby(["Anp","media"])["tarif"].sum().unstack(fill_value=0).reindex(self.years, fill_value=0)
-        for m in ["AF","TV","PR","RD","CN"]:
-            if m not in pt.columns: pt[m] = 0
-        return pt
+def extract_first_time_from_text(val):
+    if val is None:
+        return None
+    s = str(val)
+    found = re.findall(r"(\d{1,2})\s*[:hH]\s*(\d{2})", s)
+    if not found:
+        return None
+    times = []
+    for hh, mm in found:
+        hh_i = int(hh)
+        mm_i = int(mm)
+        if 0 <= hh_i <= 29 and 0 <= mm_i <= 59:
+            times.append((hh_i, mm_i))
+    if not times:
+        return None
+    hh_i, mm_i = min(times)
+    return time(hh_i % 24, mm_i, 0)
 
-    def media_mix_last_year(self) -> dict:
-        if not self.year_last: return {}
-        row = self.total_by_year_media().loc[self.year_last]
-        total = row.sum()
-        return {k: v/total*100 for k,v in row.items() if v > 0} if total else {}
+def to_excel_time(val):
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except:
+        pass
 
-    def seasonality_by_year(self) -> pd.DataFrame:
-        pt = self.df.groupby(["Anp","moisp"])["tarif"].sum().unstack(fill_value=0).reindex(columns=range(1,13), fill_value=0)
-        pt.index = [int(y) for y in pt.index]
-        return pt
+    if isinstance(val, time):
+        return val
+    if isinstance(val, datetime):
+        return val.time()
+    if isinstance(val, pd.Timestamp):
+        if pd.isna(val):
+            return None
+        return val.to_pydatetime().time()
 
-    def top_annonceurs_by_year(self, year, n=TOP_N_ANNONCEURS) -> pd.Series:
-        return self.df[self.df["Anp"]==year].groupby("Marque")["tarif"].sum().sort_values(ascending=False).head(n)
+    if isinstance(val, (float, int)):
+        seconds = int(round(float(val) * 86400))
+        seconds = max(0, min(seconds, 86399))
+        return time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
 
-    def _focus(self, code): return self.df[self.df["media"]==code].copy()
-
-    def total_focus_by_year(self, code) -> dict:
-        return self._focus(code).groupby("Anp")["tarif"].sum().reindex(self.years, fill_value=0).to_dict()
-
-    def top_ann_focus_last(self, code, n=TOP_N_ANNONCEURS) -> pd.Series:
-        return self._focus(code)[self._focus(code)["Anp"]==self.year_last].groupby("Marque")["tarif"].sum().sort_values(ascending=False).head(n)
-
-    def split_support_last(self, code, n=TOP_N_SUPPORT) -> pd.Series:
-        return self._focus(code)[self._focus(code)["Anp"]==self.year_last].groupby("supportp")["tarif"].sum().sort_values(ascending=False).head(n)
-
-    def evol_pct(self, new, old):
-        return (new-old)/abs(old)*100 if old and old != 0 else None
-
-    def sos(self, code=None) -> dict:
-        top   = self.top_ann_focus_last(code) if code else self.top_annonceurs_by_year(self.year_last)
-        total = self.total_focus_by_year(code).get(self.year_last,0) if code else self.total_by_year().get(self.year_last,0)
-        return {b: v/total*100 for b,v in top.items()} if total else {}
-
-    def summary_stats(self) -> dict:
-        totals = self.total_by_year()
-        mix    = self.media_mix_last_year()
-        s = {"years": self.years, "year_last": self.year_last, "totals": totals,
-             "total_last": totals.get(self.year_last,0),
-             "total_prev": totals.get(self.year_prev,0),
-             "total_prev2": totals.get(self.year_prev2,0),
-             "evol_vs_prev":  self.evol_pct(totals.get(self.year_last,0), totals.get(self.year_prev,0)),
-             "evol_vs_prev2": self.evol_pct(totals.get(self.year_last,0), totals.get(self.year_prev2,0)),
-             "media_mix": mix,
-             "dominant_media": max(mix, key=mix.get) if mix else None,
-             "dominant_media_pct": max(mix.values()) if mix else 0,
-        }
-        seas = self.seasonality_by_year()
-        if self.year_last and self.year_last in seas.index:
-            peak = int(seas.loc[self.year_last].idxmax())
-            s["peak_month"] = MONTHS_FR[peak-1]
-            s["peak_value"] = seas.loc[self.year_last, peak]
-
-        top_ann = self.top_annonceurs_by_year(self.year_last) if self.year_last else pd.Series()
-        if len(top_ann):
-            s["top1_ann"] = top_ann.index[0]
-            s["top1_val"] = top_ann.iloc[0]
-            s["top1_sos"] = self.sos().get(top_ann.index[0], 0)
-        if len(top_ann) > 1:
-            s["top3_sos"] = sum(list(self.sos().values())[:3])
-
-        for code in ["AF","TV","PR","RD","CN"]:
-            sub = self.total_focus_by_year(code)
-            if sub.get(self.year_last,0) > 0:
-                s[f"{code}_last"] = sub.get(self.year_last,0)
-                s[f"{code}_prev"] = sub.get(self.year_prev,0)
-                s[f"{code}_evol"] = self.evol_pct(sub.get(self.year_last,0), sub.get(self.year_prev,0))
-                sup = self.split_support_last(code)
-                if len(sup):
-                    tot = sub.get(self.year_last,0)
-                    s[f"{code}_top_sup"]     = sup.index[0]
-                    s[f"{code}_top_sup_pct"] = sup.iloc[0]/tot*100 if tot else 0
-                ann = self.top_ann_focus_last(code)
-                if len(ann):
-                    s[f"{code}_top1_ann"] = ann.index[0]
-                    s[f"{code}_top1_sos"] = self.sos(code).get(ann.index[0],0)
-        return s
-
-
-# ─────────────────────────────────────────────
-# 2. COMMENTAIRES IA
-# ─────────────────────────────────────────────
-def generate_comments_via_claude(stats: dict, secteur: str, label: str, api_key: str) -> dict:
-    import requests, json, re as re2
-
-    yl  = stats.get("year_last","")
-    yp  = stats["years"][-2] if len(stats["years"])>=2 else ""
-    yp2 = stats["years"][-3] if len(stats["years"])>=3 else ""
-
-    def fm(v):  return f"{v/1e6:.1f} M MAD" if v else "N/A"
-    def fp(v):  return f"{'+'if v and v>0 else''}{v:.1f}%" if v is not None else "N/A"
-    def ypl(y): return str(int(y)) if y else "N-1"
-
-    ctx = f"""Secteur: {secteur} | Sous-secteur: {label} | Période: {yp2}–{yl}
-GLOBAL: {yl}: {fm(stats.get('total_last'))} | {ypl(yp)}: {fm(stats.get('total_prev'))} | {ypl(yp2)}: {fm(stats.get('total_prev2'))}
-Évol vs {ypl(yp)}: {fp(stats.get('evol_vs_prev'))} | Évol vs {ypl(yp2)}: {fp(stats.get('evol_vs_prev2'))}
-Mix: {', '.join(f"{k}:{v:.0f}%" for k,v in stats.get('media_mix',{}).items())} | Pic: {stats.get('peak_month','')} ({fm(stats.get('peak_value'))})
-Top annonceur: {stats.get('top1_ann','')} — {fm(stats.get('top1_val'))} — SOS {stats.get('top1_sos',0):.0f}%
-""" + "\n".join(
-        f"{c}: {fm(stats.get(f'{c}_last'))} | Évol {fp(stats.get(f'{c}_evol'))} | Top: {stats.get(f'{c}_top_sup','')} ({stats.get(f'{c}_top_sup_pct',0):.0f}%) | Leader: {stats.get(f'{c}_top1_ann','')} (SOS {stats.get(f'{c}_top1_sos',0):.0f}%)"
-        for c in ["AF","TV","PR","RD","CN"] if stats.get(f"{c}_last")
-    )
-
-    medias_present = [c for c in ["AF","TV","PR","RD","CN"] if stats.get(f"{c}_last")]
-    media_keys = {c: f"slide_{c.lower()}" for c in medias_present}
-
-    slides_json = '{\n  "slide2_global": "...",\n  "slide2_headline": "...",\n  "slide3_annonceurs": "..."'
-    for c in medias_present:
-        slides_json += f',\n  "slide_{c.lower()}": "commentaire {MEDIA_LABELS.get(c,c)}"'
-    slides_json += "\n}"
-
-    prompt = f"""Expert media planner Maroc. Génère commentaires analytiques CONCIS pour Media Review PPT.
-Données:\n{ctx}
-
-JSON uniquement (2-4 phrases par commentaire, chiffres clés en M MAD et %, ton professionnel):
-{slides_json}"""
+    if isinstance(val, str):
+        t0 = extract_first_time_from_text(val)
+        if t0 is not None:
+            return t0
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 2000,
-                  "messages": [{"role":"user","content":prompt}]},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        text = re2.sub(r"^```json\s*|```$","", resp.json()["content"][0]["text"].strip(), flags=re2.MULTILINE).strip()
-        return json.loads(text)
-    except Exception:
-        yp_l = ypl(yp); yp2_l = ypl(yp2)
-        out = {
-            "slide2_global":    f"Mix médias {yl} : {', '.join(f'{MEDIA_LABELS.get(k,k)} {v:.0f}%' for k,v in stats.get('media_mix',{}).items())}. Pic saisonnalité : {stats.get('peak_month','')} ({fm(stats.get('peak_value'))}).",
-            "slide2_headline":  f"{yl} : {fm(stats.get('total_last'))} ({fp(stats.get('evol_vs_prev'))} vs {yp_l}), ({fp(stats.get('evol_vs_prev2'))} vs {yp2_l})",
-            "slide3_annonceurs":f"Leader {yl} : {stats.get('top1_ann','')} avec {fm(stats.get('top1_val'))} (SOS {stats.get('top1_sos',0):.0f}%). Top 3 = {stats.get('top3_sos',0):.0f}% du marché.",
-        }
-        for c in ["AF","TV","PR","RD","CN"]:
-            if stats.get(f"{c}_last"):
-                out[f"slide_{c.lower()}"] = f"{MEDIA_LABELS.get(c,c)} {yl} : {fm(stats.get(f'{c}_last'))} ({fp(stats.get(f'{c}_evol'))} vs {yp_l}). {stats.get(f'{c}_top_sup','')} = {stats.get(f'{c}_top_sup_pct',0):.0f}%. Leader : {stats.get(f'{c}_top1_ann','')} (SOS {stats.get(f'{c}_top1_sos',0):.0f}%)."
-        return out
+        s = str(val).strip().replace("h", ":").replace("H", ":")
+        t = pd.to_datetime(s, errors="coerce")
+        if pd.isna(t):
+            return None
+        return t.to_pydatetime().time()
+    except:
+        return None
 
+def code_hhmm_digits(x):
+    if x is None:
+        return None
+    s = str(x).strip().upper().replace("H", ":")
+    m = re.search(r"(\d{3,4})", s)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{2})", s)
+    if m2:
+        hh = int(m2.group(1))
+        mm = int(m2.group(2))
+        return f"{hh:02d}{mm:02d}"
+    return None
 
-# ─────────────────────────────────────────────
-# 3. HELPERS XML CHARTS
-# ─────────────────────────────────────────────
+def parse_codepm_time(code_pm: str):
+    hhmm = code_hhmm_digits(code_pm)
+    if not hhmm:
+        return None, False, None
 
-import math
+    if len(hhmm) == 3:
+        hh = int(hhmm[0]); mm = int(hhmm[1:])
+    else:
+        hh = int(hhmm[:2]); mm = int(hhmm[2:])
 
-def smart_max(values_mad: list) -> float:
-    """Calcule un max d'axe arrondi. Entrée en MAD, sortie en MILLIONS (valeurs déjà converties)."""
-    vals = [v for v in values_mad if v is not None and v > 0]
-    if not vals:
-        return 1.0
-    raw_max = max(vals) / 1e6
-    magnitude = 10 ** math.floor(math.log10(raw_max))
-    for mult in [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25, 30, 40, 50]:
-        candidate = magnitude * mult
-        if candidate >= raw_max * 1.10:
-            return candidate  # en millions
-    return raw_max * 1.2
+    if mm < 0 or mm > 59:
+        return None, False, None
 
+    tv_minutes = hh * 60 + mm
+    overnight = hh >= 24
+    hh_mod = hh % 24
+    return time(hh_mod, mm, 0), overnight, tv_minutes
 
-def _fix_val_axis(root, max_val_millions: float):
-    """
-    Met à jour tous les axes Y (valAx).
-    Valeurs déjà en MILLIONS dans le cache → pas de dispUnits, max en millions.
-    """
-    for val_ax in root.findall(f".//{ctag('valAx')}"):
-        # Supprimer dispUnits (valeurs déjà en millions, plus besoin de division)
-        for child in list(val_ax):
-            if child.tag == ctag("dispUnits"):
-                val_ax.remove(child)
+def real_tv_minutes(t: time, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
+    if t is None:
+        return None
+    m = t.hour * 60 + t.minute
+    if t.hour < cutoff_hour:
+        m += 1440
+    return m
 
-        # numFmt "0.0" sur les millions → affiche "6.4", "18.2"
-        nf = val_ax.find(ctag("numFmt"))
-        if nf is None:
-            nf = etree.SubElement(val_ax, ctag("numFmt"))
-        nf.set("formatCode", "0.0")
-        nf.set("sourceLinked", "0")
+def pm_tv_minutes_tvday(code_pm: str, fallback=None, cutoff_hour: int = TV_DAY_CUTOFF_HOUR):
+    try:
+        if fallback is not None and pd.notna(fallback):
+            tvm = int(fallback)
+        else:
+            tvm = None
+    except:
+        tvm = None
 
-        # Max en millions
-        scaling = val_ax.find(ctag("scaling"))
-        if scaling is None:
-            scaling = etree.Element(ctag("scaling"))
-            val_ax.insert(0, scaling)
-        max_el = scaling.find(ctag("max"))
-        if max_el is None:
-            max_el = etree.SubElement(scaling, ctag("max"))
-        max_el.set("val", str(round(max_val_millions, 2)))
+    if tvm is None:
+        _, _, tvm = parse_codepm_time(code_pm)
 
-        min_el = scaling.find(ctag("min"))
-        if min_el is None:
-            min_el = etree.SubElement(scaling, ctag("min"))
-        min_el.set("val", "0")
+    if tvm is None:
+        return 10**9
 
-def _set_num_fmt(dlbls_el, fmt_code: str):
-    """Change le format des étiquettes dans un dLbls."""
-    nf = dlbls_el.find(ctag("numFmt"))
-    if nf is None:
-        nf = etree.SubElement(dlbls_el, ctag("numFmt"))
-        dlbls_el.insert(0, nf)
-    nf.set("formatCode", fmt_code)
-    nf.set("sourceLinked", "0")
+    hh = tvm // 60
+    if hh < 24 and hh < cutoff_hour:
+        tvm += 1440
+    return tvm
 
+def make_zip(files: dict) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return bio.getvalue()
 
-def _set_show_flags(dlbls_el, show_val="0", show_pct="0"):
-    """Active/désactive val et percent dans dLbls."""
-    for tag, val in [("showVal", show_val), ("showPercent", show_pct),
-                     ("showLegendKey","0"), ("showCatName","0"),
-                     ("showSerName","0"), ("showBubbleSize","0")]:
-        el = dlbls_el.find(ctag(tag))
-        if el is not None:
-            el.set("val", val)
+def get_min_max_date_from_raw(df_in: pd.DataFrame, mode: str):
+    col = find_column(df_in, ["datep", "date"]) if mode == "Suivi Imperium" else find_column(df_in, ["date"])
+    if not col:
+        return None, None
+    s = pd.to_datetime(df_in[col], errors="coerce").dropna()
+    if s.empty:
+        return None, None
+    return s.dt.date.min(), s.dt.date.max()
 
+# =========================
+# Swap decision (fallback)
+# =========================
+def should_swap(rt_i, pm_i, pm_j, rt_next=None):
+    if rt_i is None:
+        return False
+    d1 = abs(rt_i - pm_i) if pm_i < 10**9 else 10**9
+    d2 = abs(rt_i - pm_j) if pm_j < 10**9 else 10**9
+    if not (d2 <= SWAP_NEAR_MINUTES and d1 > SWAP_PM1_FAR_MINUTES):
+        return False
+    if rt_next is None:
+        return True
+    e1 = abs(rt_next - pm_i) if pm_i < 10**9 else 10**9
+    e2 = abs(rt_next - pm_j) if pm_j < 10**9 else 10**9
+    if e2 <= ANTI_VOL_NEXT_MAX and e2 < e1 and e1 > d1:
+        return False
+    return True
 
-def _rebuild_cache(ser_el, categories: list, values: list, divide_by: float = 1.0):
-    """Met à jour catégories + valeurs dans le cache XML d'une série.
-    divide_by : diviser les valeurs avant écriture (ex: 1e6 pour millions)
-    """
-    # Catégories
-    cat_el = ser_el.find(ctag("cat"))
-    if cat_el is not None:
-        # numRef ou strRef
-        for ref_type in ["numRef", "strRef"]:
-            ref = cat_el.find(ctag(ref_type))
-            if ref is not None:
-                for cache_type in ["numCache", "strCache"]:
-                    cache = ref.find(ctag(cache_type))
-                    if cache is not None:
-                        for pt in cache.findall(ctag("pt")): cache.remove(pt)
-                        pc = cache.find(ctag("ptCount"))
-                        if pc is None: pc = etree.SubElement(cache, ctag("ptCount"))
-                        pc.set("val", str(len(categories)))
-                        for i,c in enumerate(categories):
-                            pt = etree.SubElement(cache, ctag("pt"))
-                            pt.set("idx", str(i))
-                            v = etree.SubElement(pt, ctag("v"))
-                            v.text = str(c)
-                        f_el = ref.find(ctag("f"))
-                        if f_el is not None:
-                            m = re.match(r"(.+)!\$([A-Z]+)\$\d+:\$[A-Z]+\$\d+", f_el.text or "")
-                            if m: f_el.text = f"{m.group(1)}!${m.group(2)}$2:${m.group(2)}${len(categories)+1}"
+# =========================
+# Post-fix: force match if PM still available
+# =========================
+def force_assign_unmatched_reals(assign, rt_minutes, pm_minutes):
+    used = set(j for j in assign if j is not None)
+    remaining_pm = [j for j in range(len(pm_minutes)) if j not in used]
+    if not remaining_pm:
+        return assign
 
-    # Valeurs
-    val_el = ser_el.find(ctag("val"))
-    if val_el is not None:
-        num_ref = val_el.find(ctag("numRef"))
-        if num_ref is not None:
-            cache = num_ref.find(ctag("numCache"))
-            if cache is None: cache = etree.SubElement(num_ref, ctag("numCache"))
-            for pt in cache.findall(ctag("pt")): cache.remove(pt)
-            # Forcer le formatCode du cache à "0.0" pour que PPT l'utilise correctement
-            fc = cache.find(ctag("formatCode"))
-            if fc is None: fc = etree.SubElement(cache, ctag("formatCode"))
-            fc.text = "0.0"
-            pc = cache.find(ctag("ptCount"))
-            if pc is None: pc = etree.SubElement(cache, ctag("ptCount"))
-            pc.set("val", str(len(values)))
-            for i,v in enumerate(values):
-                if v is None: continue
-                pt = etree.SubElement(cache, ctag("pt"))
-                pt.set("idx", str(i))
-                ve = etree.SubElement(pt, ctag("v"))
-                if v is None:
-                    ve.text = ""
-                else:
-                    v_out = v / divide_by if divide_by != 1.0 else v
-                    ve.text = str(v_out)
-            f_el = num_ref.find(ctag("f"))
-            if f_el is not None:
-                m = re.match(r"(.+)!\$([A-Z]+)\$\d+:\$[A-Z]+\$\d+", f_el.text or "")
-                if m: f_el.text = f"{m.group(1)}!${m.group(2)}$2:${m.group(2)}${len(values)+1}"
-
-
-def _set_series_name(ser_el, name: str):
-    tx_v = ser_el.find(f".//{ctag('tx')}//{ctag('v')}")
-    if tx_v is not None:
-        tx_v.text = str(name)
-
-
-def _build_peak_dlbls(ser_el, values: list, top_n: int = 3) -> None:
-    """
-    Pour la saisonnalité : supprime tous les dLbl individuels,
-    puis ajoute des dLbl uniquement pour les top_n pics.
-    """
-    dlbls = ser_el.find(ctag("dLbls"))
-    if dlbls is None:
-        return
-
-    # Supprimer dLbl individuels existants
-    for dl in dlbls.findall(ctag("dLbl")):
-        dlbls.remove(dl)
-
-    # Format global millions + masquer val par défaut
-    _set_num_fmt(dlbls, FMT_MILLIONS)
-    sv = dlbls.find(ctag("showVal"))
-    if sv is not None: sv.set("val","0")
-
-    if not values:
-        return
-
-    # Trouver les indices des top_n pics
-    vals_clean = [(i, v) for i,v in enumerate(values) if v is not None and v > 0]
-    vals_clean.sort(key=lambda x: -x[1])
-    peak_indices = {i for i,_ in vals_clean[:top_n]}
-
-    # Créer un dLbl pour chaque pic (avant showVal global)
-    for idx in sorted(peak_indices):
-        dl = etree.Element(ctag("dLbl"))
-        idx_el = etree.SubElement(dl, ctag("idx"))
-        idx_el.set("val", str(idx))
-        nf = etree.SubElement(dl, ctag("numFmt"))
-        nf.set("formatCode", FMT_MILLIONS)
-        nf.set("sourceLinked","0")
-        pos = etree.SubElement(dl, ctag("dLblPos"))
-        pos.set("val","t")
-        for tag in ["showLegendKey","showVal","showCatName","showSerName","showPercent","showBubbleSize"]:
-            e = etree.SubElement(dl, ctag(tag))
-            e.set("val","1" if tag=="showVal" else "0")
-        # Insérer avant showVal global
-        dlbls.insert(0, dl)
-
-
-def process_chart1_annual(chart_xml: bytes, cats: list, vals: list) -> bytes:
-    """Investissements annuels — format millions sur les étiquettes et l'axe."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    if sers:
-        _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
-        _set_series_name(sers[0], "Total")
-        dlbls = root.find(f".//{ctag('dLbls')}")
-        if dlbls is not None:
-            _set_num_fmt(dlbls, FMT_MILLIONS)
-            _set_show_flags(dlbls, show_val="1", show_pct="0")
-    _fix_val_axis(root, smart_max(vals))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart2_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFrame) -> bytes:
-    """Répartition par média stacked 100% — étiquettes en %."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    media_order = ["AF","PR","RD","TV","CN"]
-
-    for i, m in enumerate(media_order):
-        if i >= len(sers): break
-        vals = [media_matrix.loc[y,m] if m in media_matrix.columns else None for y in years]
-        vals_clean = [v if v and v>0 else None for v in vals]
-        _rebuild_cache(sers[i], [int(y) for y in years], vals_clean, divide_by=1e6)
-        _set_series_name(sers[i], m)
-
-        # Ajouter dLbls sur la série si absent (PowerPoint ignore le dLbls global pour stacked)
-        dlbls = sers[i].find(ctag("dLbls"))
-        if dlbls is None:
-            dlbls = etree.SubElement(sers[i], ctag("dLbls"))
-
-        # Vider et reconstruire proprement
-        for child in list(dlbls):
-            dlbls.remove(child)
-
-        nf = etree.SubElement(dlbls, ctag("numFmt"))
-        nf.set("formatCode", "0%")
-        nf.set("sourceLinked", "0")
-        for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
-                         ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
-            el = etree.SubElement(dlbls, ctag(tag))
-            el.set("val", val)
-
-    # dLbls global sur barChart (fallback)
-    bar_chart = root.find(f".//{ctag('barChart')}")
-    if bar_chart is not None:
-        dlbls_g = bar_chart.find(ctag("dLbls"))
-        if dlbls_g is None:
-            dlbls_g = etree.SubElement(bar_chart, ctag("dLbls"))
-        _set_num_fmt(dlbls_g, "0%")
-        _set_show_flags(dlbls_g, show_val="0", show_pct="1")
-
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart3_seasonality(chart_xml: bytes, years: list, seas: pd.DataFrame) -> bytes:
-    """Saisonnalité — valeurs en millions, étiquettes sur 3 pics par année."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    all_vals = []
-    for i, y in enumerate(years):
-        ser_idx = i + 1
-        if ser_idx >= len(sers): break
-        ser = sers[ser_idx]
-        month_vals = [seas.loc[y,m] if y in seas.index and m in seas.columns else 0
-                      for m in range(1,13)]
-        all_vals.extend(month_vals)
-        _rebuild_cache(ser, MONTHS_FR, month_vals, divide_by=1e6)
-        _set_series_name(ser, str(int(y)))
-        _build_peak_dlbls(ser, month_vals, top_n=3)
-    _fix_val_axis(root, smart_max(all_vals))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart_annonceurs(chart_xml: bytes, cats: list, vals: list, year_label: str) -> bytes:
-    """Bar annonceurs — format millions, max 15."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    if sers:
-        cats = cats[:TOP_N_ANNONCEURS]
-        vals = vals[:TOP_N_ANNONCEURS]
-        _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
-        _set_series_name(sers[0], year_label)
-        dlbls = root.find(f".//{ctag('dLbls')}")
-        if dlbls is not None:
-            _set_num_fmt(dlbls, FMT_MILLIONS)
-            _set_show_flags(dlbls, show_val="1", show_pct="0")
-    _fix_val_axis(root, smart_max(vals))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart_media_annual(chart_xml: bytes, cats: list, vals: list, label: str) -> bytes:
-    """Trend annuel média (bar clustered) — format millions."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    if sers:
-        _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
-        _set_series_name(sers[0], label)
-        dlbls = root.find(f".//{ctag('dLbls')}")
-        if dlbls is not None:
-            _set_num_fmt(dlbls, FMT_MILLIONS)
-            _set_show_flags(dlbls, show_val="1", show_pct="0")
-    _fix_val_axis(root, smart_max(vals))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart_top_ann(chart_xml: bytes, cats: list, vals: list, label: str) -> bytes:
-    """Top annonceurs focus média — format millions."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    if sers:
-        cats = cats[:TOP_N_ANNONCEURS]
-        vals = vals[:TOP_N_ANNONCEURS]
-        _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
-        _set_series_name(sers[0], label)
-        dlbls = root.find(f".//{ctag('dLbls')}")
-        if dlbls is not None:
-            _set_num_fmt(dlbls, FMT_MILLIONS)
-            _set_show_flags(dlbls, show_val="1", show_pct="0")
-    _fix_val_axis(root, smart_max(vals))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def process_chart_pie(chart_xml: bytes, cats: list, vals: list, label: str) -> bytes:
-    """Pie répartition — garder % comme dans le template."""
-    root = etree.fromstring(chart_xml)
-    sers = root.findall(f".//{ctag('ser')}")
-    if sers:
-        _rebuild_cache(sers[0], cats, vals, divide_by=1e6)
-        _set_series_name(sers[0], label)
-        # Garder le format existant (%)
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-# ─────────────────────────────────────────────
-# 4. GESTION DES SLIDES DYNAMIQUES
-# ─────────────────────────────────────────────
-
-def _replace_tf_in_xml(txBody, new_text: str):
-    """Remplace le contenu texte d'un txBody XML."""
-    pns = ANS
-    def qtag(n): return f"{{{pns}}}{n}"
-
-    font_sz = font_b = None
-    for p in txBody.findall(qtag("p")):
-        for r in p.findall(qtag("r")):
-            rpr = r.find(qtag("rPr"))
-            if rpr is not None:
-                font_sz = rpr.get("sz")
-                font_b  = rpr.get("b")
-                break
-        if font_sz: break
-
-    first_pPr = None
-    paras = txBody.findall(qtag("p"))
-    if paras:
-        first_pPr = paras[0].find(qtag("pPr"))
-
-    for p in list(txBody.findall(qtag("p"))): txBody.remove(p)
-
-    for line in new_text.split("\n"):
-        p_el = etree.SubElement(txBody, qtag("p"))
-        if first_pPr is not None: p_el.insert(0, deepcopy(first_pPr))
-        if not line.strip():
-            end = etree.SubElement(p_el, qtag("endParaRPr"))
-            end.set("lang","fr-FR"); end.set("dirty","0")
+    for i in range(len(assign)):
+        if assign[i] is not None:
             continue
-        r_el  = etree.SubElement(p_el, qtag("r"))
-        rpr   = etree.SubElement(r_el, qtag("rPr"))
-        rpr.set("lang","fr-FR"); rpr.set("dirty","0")
-        if font_sz: rpr.set("sz", font_sz)
-        if font_b:  rpr.set("b", font_b)
-        t_el  = etree.SubElement(r_el, qtag("t"))
-        t_el.text = line
+        if not remaining_pm:
+            break
+        rt = rt_minutes[i]
+        if rt is None or rt >= 10**9:
+            continue
+        best_j = min(remaining_pm, key=lambda j: abs(rt - pm_minutes[j]) if pm_minutes[j] < 10**9 else 10**9)
+        assign[i] = best_j
+        remaining_pm.remove(best_j)
+
+    return assign
+
+# =========================
+# Matching engine (Exact + DP)
+# =========================
+def match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes):
+    n = len(rt_minutes)
+    m = len(pm_minutes)
+
+    assign = [None] * n
+    used_pm = set()
+    locked_real = set()
+
+    if real_codes and pm_codes and len(real_codes) == n and len(pm_codes) == m:
+        for i in range(n):
+            rc = real_codes[i]
+            if not rc:
+                continue
+            for j in range(m):
+                if j in used_pm:
+                    continue
+                if pm_codes[j] == rc:
+                    assign[i] = j
+                    used_pm.add(j)
+                    locked_real.add(i)
+                    break
+
+    real_rem = [i for i in range(n) if i not in locked_real]
+    pm_rem = [j for j in range(m) if j not in used_pm]
+
+    if not USE_OPTIMAL_MATCHING:
+        remaining_real = [i for i in range(n) if assign[i] is None]
+        k = min(len(remaining_real), len(pm_rem))
+        for idx in range(k):
+            assign[remaining_real[idx]] = pm_rem[idx]
+
+        for i in range(n - 1):
+            if i in locked_real or (i + 1) in locked_real:
+                continue
+            j1 = assign[i]
+            j2 = assign[i + 1]
+            if j1 is None or j2 is None:
+                continue
+            if j2 != j1 + 1:
+                continue
+            rt_i = rt_minutes[i]
+            rt_next = rt_minutes[i + 1]
+            if should_swap(rt_i, pm_minutes[j1], pm_minutes[j2], rt_next=rt_next):
+                assign[i], assign[i + 1] = assign[i + 1], assign[i]
+        return assign
+
+    INF = 10**15
+    A = len(real_rem)
+    B = len(pm_rem)
+
+    pm_skip_penalty = PM_SKIP_PENALTY
+    real_skip_penalty = REAL_SKIP_PENALTY
+    if A >= B and B > 0:
+        pm_skip_penalty = 10**12
+
+    dp = [[INF] * (B + 1) for _ in range(A + 1)]
+    prev = [[None] * (B + 1) for _ in range(A + 1)]
+    dp[0][0] = 0
+
+    for b in range(1, B + 1):
+        dp[0][b] = dp[0][b - 1] + pm_skip_penalty
+        prev[0][b] = ("SKIP_PM", 0, b - 1)
+
+    for a in range(1, A + 1):
+        dp[a][0] = dp[a - 1][0] + real_skip_penalty
+        prev[a][0] = ("SKIP_REAL", a - 1, 0)
+
+    def match_cost(rt, pmv):
+        if rt is None or pmv is None or rt >= 10**9 or pmv >= 10**9:
+            return HARD_MAX_MATCH * 10
+        d = abs(rt - pmv)
+        if d > HARD_MAX_MATCH:
+            return d + 5000
+        return d
+
+    for a in range(1, A + 1):
+        i = real_rem[a - 1]
+        rt = rt_minutes[i]
+        for b in range(1, B + 1):
+            j = pm_rem[b - 1]
+            pmv = pm_minutes[j]
+
+            best = dp[a - 1][b - 1] + match_cost(rt, pmv)
+            best_prev = ("MATCH", a - 1, b - 1)
+
+            c_spm = dp[a][b - 1] + pm_skip_penalty
+            if c_spm < best:
+                best = c_spm
+                best_prev = ("SKIP_PM", a, b - 1)
+
+            c_sreal = dp[a - 1][b] + real_skip_penalty
+            if c_sreal < best:
+                best = c_sreal
+                best_prev = ("SKIP_REAL", a - 1, b)
+
+            dp[a][b] = best
+            prev[a][b] = best_prev
+
+    a, b = A, B
+    pairs = []
+    while a > 0 or b > 0:
+        step, pa, pb = prev[a][b]
+        if step == "MATCH":
+            i = real_rem[a - 1]
+            j = pm_rem[b - 1]
+            pairs.append((i, j))
+        a, b = pa, pb
+
+    for i, j in pairs:
+        assign[i] = j
+
+    return assign
+
+# =========================
+# Template loader
+# =========================
+def load_template_workbook(mode: str) -> openpyxl.Workbook:
+    if mode == "Suivi YUMI":
+        return openpyxl.load_workbook(TEMPLATE_YUMI_PATH)
+    return openpyxl.load_workbook(TEMPLATE_IMPERIUM_PATH)
+
+# =========================
+# PM 2026 parsing
+# =========================
+def parse_sheet_name(sheet_name: str, known_support_norms=None):
+    tokens = sheet_name.strip().split()
+    if not tokens:
+        return None, None, None
+
+    vocab = set(known_support_norms or set())
+    vocab |= {"2M", "MBC5", "ALAOULA"}
+
+    best = None
+    for k in range(1, min(4, len(tokens)) + 1):
+        sup = " ".join(tokens[-k:])
+        sup_norm = normalize_support(sup)
+        if sup_norm in vocab:
+            brand = " ".join(tokens[:-k]).strip()
+            if brand:
+                best = (brand, sup, sup_norm)
+    if best:
+        return best
+
+    sup = tokens[-1]
+    brand = " ".join(tokens[:-1]).strip() or sheet_name
+    return brand, sup, normalize_support(sup)
+
+def read_pm_2026_workbook(pm_bytes: bytes, known_support_norms: set) -> pd.DataFrame:
+    wb = openpyxl.load_workbook(io.BytesIO(pm_bytes), data_only=True)
+    recs = []
+    for sh in wb.sheetnames:
+        ws = wb[sh]
+        brand, sup_disp, sup_norm = parse_sheet_name(sh, known_support_norms)
+        if not brand:
+            continue
+
+        for r in range(2, ws.max_row + 1):
+            d = ws.cell(r, 1).value
+            code = ws.cell(r, 2).value
+
+            if d is None and code is None:
+                continue
+            if code is None or str(code).strip() == "":
+                continue
+
+            d_parsed = pd.to_datetime(d, errors="coerce", dayfirst=True)
+            if pd.isna(d_parsed):
+                continue
+            d_date = d_parsed.date()
+
+            codepm = str(code).strip()
+            _, overnight, tvm_raw = parse_codepm_time(codepm)
+
+            recs.append({
+                "PM_FILE_BRAND": brand,
+                "PM_FILE_BRAND_N": brand_key(brand),
+                "Date": pd.to_datetime(d_date),
+                "date_only": d_date,
+                "supportp": sup_disp,
+                "support_norm": sup_norm,
+                "Code PM": codepm,
+                "Overnight": overnight,
+                "PM_TV_MIN": tvm_raw,
+            })
+
+    return pd.DataFrame(recs)
+
+# =========================
+# DATA builders
+# =========================
+def build_final_df_from_imperium(df_imp: pd.DataFrame, date_min: date, date_max: date) -> pd.DataFrame:
+    col_date = find_column(df_imp, ["datep", "date"])
+    col_sup  = find_column(df_imp, ["supportp", "support", "chaine", "station"])
+    col_time = find_column(df_imp, ["heurep", "heure"])
+    col_mar  = find_column(df_imp, ["marque"])
+    if not all([col_date, col_sup, col_time, col_mar]):
+        raise ValueError("DATA IMPERIUM: colonnes minimales manquantes (datep/supportp/heurep/marque).")
+
+    df = df_imp.copy()
+    df["datep"] = pd.to_datetime(df[col_date], errors="coerce")
+    df = df[df["datep"].dt.date >= date_min]
+    df = df[df["datep"].dt.date <= date_max]
+
+    out = pd.DataFrame()
+    out["datep"] = df["datep"]
+    out["supportp"] = df[col_sup].astype(str).str.strip()
+    out["support_norm"] = out["supportp"].apply(normalize_support)
+    out["heure de diffusion"] = df[col_time]
+    out["Marque"] = df[col_mar].astype(str).str.strip()
+    out["Marque_norm"] = out["Marque"].apply(brand_key)
+
+    out["Message"] = df[find_column(df_imp, ["message", "storyboard"])] if find_column(df_imp, ["message", "storyboard"]) else None
+    out["Produit"] = df[find_column(df_imp, ["produit"])] if find_column(df_imp, ["produit"]) else None
+    out["RaisonSociale"] = df[find_column(df_imp, ["raisonsociale", "raison sociale"])] if find_column(df_imp, ["raisonsociale", "raison sociale"]) else None
+    out["FormatSec"] = df[find_column(df_imp, ["formatsec", "format"])] if find_column(df_imp, ["formatsec", "format"]) else None
+    out["Avant"] = df[find_column(df_imp, ["avant"])] if find_column(df_imp, ["avant"]) else None
+    out["Apres"] = df[find_column(df_imp, ["apres", "après"])] if find_column(df_imp, ["apres", "après"]) else None
+    out["rangE"] = df[find_column(df_imp, ["range", "rang"])] if find_column(df_imp, ["range", "rang"]) else None
+    out["encombE"] = df[find_column(df_imp, ["encombe", "encombrement"])] if find_column(df_imp, ["encombe", "encombrement"]) else None
+
+    out["Code PM"] = None
+    out["Commentaire"] = None
+    return out
+
+def build_final_df_from_yumi(df_yumi: pd.DataFrame, date_min: date, date_max: date) -> pd.DataFrame:
+    col_date   = find_column(df_yumi, ["date"])
+    col_chaine = find_column(df_yumi, ["chaine", "chaîne", "support"])
+    col_hdeb   = find_column(df_yumi, ["h.debut", "h début", "heure debut", "hdeb", "début"])
+    col_marque = find_column(df_yumi, ["marque"])
+    if not all([col_date, col_chaine, col_hdeb, col_marque]):
+        raise ValueError("DATA YUMI: colonnes minimales manquantes (Date/Chaîne/H.Début/Marque).")
+
+    df = df_yumi.copy()
+    df["__Date__"] = pd.to_datetime(df[col_date], errors="coerce")
+    df = df[df["__Date__"].dt.date >= date_min]
+    df = df[df["__Date__"].dt.date <= date_max]
+
+    out = pd.DataFrame()
+    for col in FINAL_COLUMNS_YUMI:
+        if col == "Date":
+            out[col] = df["__Date__"]
+        elif col == "Chaîne":
+            out[col] = df[col_chaine].astype(str).str.strip()
+        elif col == "H.Début":
+            out[col] = df[col_hdeb]
+        else:
+            if col in df.columns:
+                out[col] = df[col]
+            else:
+                fallback = find_column(df, [col])
+                out[col] = df[fallback] if fallback else None
+
+    out["support_norm"] = out["Chaîne"].apply(normalize_support)
+    out["Marque_norm"] = out["Marque"].apply(brand_key)
+    out["Code Ecran PM"] = None
+    out["Commentaire"] = None
+    return out
+
+# =========================
+# Fill IMPERIUM per client  — CODE ORIGINAL INTACT
+# =========================
+def fill_codepm_commentaire_per_client(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
+    df = df_client.copy()
+    df["date_only"] = pd.to_datetime(df["datep"], errors="coerce").dt.date
+    df["t_real"] = df["heure de diffusion"].apply(to_excel_time)
+
+    col_real_code = find_column(df, ["code ecran", "code écran", "ecran", "écran"])
+    if col_real_code:
+        df["_real_code_digits"] = df[col_real_code].apply(code_hhmm_digits)
+    else:
+        df["_real_code_digits"] = None
+
+    if pm_client is None or pm_client.empty:
+        base = df.copy()
+        for col in FINAL_COLUMNS_IMPERIUM:
+            if col not in base.columns:
+                base[col] = None
+        base.drop(columns=["_real_code_digits"], inplace=True, errors="ignore")
+        return base[FINAL_COLUMNS_IMPERIUM]
+
+    pm = pm_client.copy()
+    pm = pm[pm["date_only"].notna()]
+    pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
+
+    out_all = []
+    backlog_by_support = {}
+
+    supports_real = set(df["support_norm"].dropna().unique())
+    all_supports = sorted(list(supports_real))
+
+    def insert_non_diffuse_row(dte, sup_disp, codepm, pm_seq=None):
+        row = {c: None for c in FINAL_COLUMNS_IMPERIUM}
+        row["datep"] = dte
+        row["supportp"] = sup_disp
+        row["Code PM"] = codepm
+        row["Commentaire"] = "Non diffusé"
+        if pm_seq is not None:
+            row["_pm_seq"] = pm_seq
+        return row
+
+    for sn in all_supports:
+        backlog_by_support.setdefault(sn, [])
+
+        real_s = df[df["support_norm"] == sn].copy()
+        pm_s = pm[pm["support_norm"] == sn].copy()
+
+        sup_display = str(real_s.iloc[0]["supportp"]) if not real_s.empty else str(sn)
+
+        dates_real = set(real_s["date_only"].dropna().unique())
+        all_dates = sorted(list(dates_real))
+
+        for d in all_dates:
+            if d < date_min or d > date_max:
+                continue
+
+            real_day = real_s[real_s["date_only"] == d].copy()
+            real_day["_rt"] = real_day["t_real"].apply(lambda t: real_tv_minutes(t))
+            real_day = real_day.sort_values("_rt", na_position="last").drop(columns=["_rt"], errors="ignore")
+
+            pm_day = pm_s[pm_s["date_only"] == d].copy()
+            if not pm_day.empty:
+                pm_day["_PM_TV_MIN_TVDAY"] = pm_day.apply(
+                    lambda r: pm_tv_minutes_tvday(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1
+                )
+                pm_day = pm_day.sort_values("_PM_TV_MIN_TVDAY", na_position="last").drop(columns=["_PM_TV_MIN_TVDAY"], errors="ignore")
+
+            rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
+            pm_minutes = [pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
+
+            real_codes = real_day["_real_code_digits"].tolist() if "_real_code_digits" in real_day.columns else [None] * len(real_day)
+            pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
+
+            assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
+            assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
+
+            used_pm = set(j for j in assign if j is not None)
+
+            filled_rows = []
+            inserted_rows = []
+
+            for i in range(len(real_day)):
+                r = real_day.iloc[i].copy()
+                j = assign[i] if i < len(assign) else None
+
+                if j is not None and j < len(pm_day):
+                    pm_row = pm_day.iloc[j]
+                    r["Code PM"] = pm_row["Code PM"]
+
+                    diff = None
+                    if rt_minutes[i] is not None:
+                        pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
+                        if pm_min < 10**9:
+                            diff = abs(rt_minutes[i] - pm_min)
+
+                    r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                else:
+                    r["Code PM"] = None
+
+                    if backlog_by_support[sn] and rt_minutes[i] is not None:
+                        diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
+                        best_k = int(pd.Series(diffs).idxmin()) if diffs else None
+
+                        if best_k is not None:
+                            best_diff = diffs[best_k]
+                            rt = rt_minutes[i]
+
+                            is_day_7_to_24 = (rt >= 7 * 60) and (rt < 24 * 60)
+                            is_after_24_to_7 = (rt >= 24 * 60) and (rt < (24 * 60 + 7 * 60))
+
+                            if best_diff <= COMPENSATION_NEAR_MINUTES:
+                                r["Commentaire"] = "Compensation"
+                                backlog_by_support[sn].pop(best_k)
+                            else:
+                                if is_day_7_to_24:
+                                    r["Commentaire"] = "Compensation (loin)"
+                                    backlog_by_support[sn].pop(best_k)
+                                elif is_after_24_to_7:
+                                    r["Commentaire"] = "Passage supplémentaire"
+                                else:
+                                    r["Commentaire"] = "Passage supplémentaire"
+                        else:
+                            r["Commentaire"] = "Passage supplémentaire"
+                    else:
+                        r["Commentaire"] = "Passage supplémentaire"
+
+                filled_rows.append(r)
+
+            remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
+            for j in remaining_pm:
+                inserted_rows.append(insert_non_diffuse_row(d, sup_display, pm_day.iloc[j]["Code PM"], pm_seq=j))
+                pm_min = pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN"))
+                if pm_min < 10**9:
+                    backlog_by_support[sn].append(pm_min)
+
+            df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame()
+            df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS_IMPERIUM)
+
+            def sort_key_tv(row):
+                t = to_excel_time(row.get("heure de diffusion"))
+                if t is not None:
+                    return real_tv_minutes(t)
+                return pm_tv_minutes_tvday(row.get("Code PM"), None)
+
+            if not df_filled.empty:
+                df_filled["_sort_t"] = df_filled.apply(lambda rr: sort_key_tv(rr), axis=1)
+                df_filled["supportp"] = sup_display
+                if "_pm_seq" not in df_filled.columns:
+                    df_filled["_pm_seq"] = 10**9
+            if not df_insert.empty:
+                df_insert["_sort_t"] = df_insert.apply(lambda rr: sort_key_tv(rr), axis=1)
+                if "_pm_seq" not in df_insert.columns:
+                    df_insert["_pm_seq"] = 10**9
+
+            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True)
+            if not out_day.empty:
+                out_day = out_day.sort_values(["_sort_t", "_pm_seq"], na_position="last")
+                out_day = out_day.drop(columns=["_sort_t", "_pm_seq"], errors="ignore")
+
+            out_all.append(out_day[FINAL_COLUMNS_IMPERIUM])
+
+    out_df = pd.concat(out_all, ignore_index=True) if out_all else df[FINAL_COLUMNS_IMPERIUM].copy()
+    out_df.drop(columns=["_real_code_digits"], inplace=True, errors="ignore")
+    return out_df[FINAL_COLUMNS_IMPERIUM]
+
+# =========================
+# Fill YUMI per client  — CODE ORIGINAL INTACT
+# =========================
+def fill_codeecranpm_commentaire_per_client_yumi(df_client: pd.DataFrame, pm_client: pd.DataFrame, date_min: date, date_max: date):
+    df = df_client.copy()
+    df["date_only"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df["t_real"] = df["H.Début"].apply(to_excel_time)
+    df["_real_code_digits"] = df["Code Ecran"].apply(code_hhmm_digits) if "Code Ecran" in df.columns else None
+
+    if pm_client is None or pm_client.empty:
+        base = df.copy()
+        for col in FINAL_COLUMNS_YUMI:
+            if col not in base.columns:
+                base[col] = None
+        base.drop(columns=["_real_code_digits"], inplace=True, errors="ignore")
+        return base[FINAL_COLUMNS_YUMI]
+
+    pm = pm_client.copy()
+    pm = pm[pm["date_only"].notna()]
+    pm = pm[(pm["date_only"] >= date_min) & (pm["date_only"] <= date_max)]
+
+    out_all = []
+    backlog_by_support = {}
+
+    supports_real = set(df["support_norm"].dropna().unique())
+    supports_pm = set(pm["support_norm"].dropna().unique())
+    all_supports = sorted(list(supports_real | supports_pm))
+    all_supports = [sn for sn in all_supports if sn in ALLOWED_YUMI]
+
+    def insert_minimal_row_yumi(dte, chaine, codepm, pm_seq=None):
+        row = {c: None for c in FINAL_COLUMNS_YUMI}
+        dts = pd.to_datetime(dte)
+        row["Date"] = dts
+        row["Chaîne"] = chaine
+        row["N° Mois"] = int(dts.month) if not pd.isna(dts) else None
+        row["Année"] = int(dts.year) if not pd.isna(dts) else None
+        row["Code Ecran PM"] = codepm
+        row["Commentaire"] = "Non diffusé"
+        if pm_seq is not None:
+            row["_pm_seq"] = pm_seq
+        return row
+
+    for sn in all_supports:
+        backlog_by_support.setdefault(sn, [])
+
+        real_s = df[df["support_norm"] == sn].copy()
+        pm_s = pm[pm["support_norm"] == sn].copy()
+
+        sup_display = str(real_s.iloc[0]["Chaîne"]) if not real_s.empty else (str(pm_s.iloc[0]["supportp"]) if not pm_s.empty else str(sn))
+
+        dates_real = set(real_s["date_only"].dropna().unique())
+        dates_pm = set(pm_s["date_only"].dropna().unique())
+        all_dates = sorted(list(dates_real | dates_pm))
+
+        for d in all_dates:
+            if d < date_min or d > date_max:
+                continue
+
+            real_day = real_s[real_s["date_only"] == d].copy()
+            real_day["_rt"] = real_day["t_real"].apply(lambda t: real_tv_minutes(t))
+            real_day = real_day.sort_values("_rt", na_position="last").drop(columns=["_rt"], errors="ignore")
+
+            pm_day = pm_s[pm_s["date_only"] == d].copy()
+            if not pm_day.empty:
+                pm_day["_PM_TV_MIN_TVDAY"] = pm_day.apply(lambda r: pm_tv_minutes_tvday(r.get("Code PM"), r.get("PM_TV_MIN")), axis=1)
+                pm_day = pm_day.sort_values("_PM_TV_MIN_TVDAY", na_position="last").drop(columns=["_PM_TV_MIN_TVDAY"], errors="ignore")
+
+            rt_minutes = [real_tv_minutes(t) if t is not None else None for t in real_day["t_real"].tolist()]
+            pm_minutes = [pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN")) for j in range(len(pm_day))]
+
+            real_codes = real_day["_real_code_digits"].tolist() if "_real_code_digits" in real_day.columns else [None] * len(real_day)
+            pm_codes = [code_hhmm_digits(v) for v in pm_day["Code PM"].tolist()] if not pm_day.empty else []
+
+            filled_rows = []
+            inserted_rows = []
+
+            if len(real_day) == 0 and len(pm_day) > 0:
+                for j, (_, p) in enumerate(pm_day.iterrows()):
+                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, p["Code PM"], pm_seq=j))
+                    pm_min = pm_tv_minutes_tvday(p["Code PM"], p.get("PM_TV_MIN"))
+                    if pm_min < 10**9:
+                        backlog_by_support[sn].append(pm_min)
+            else:
+                assign = match_day_exact_then_order_swap(rt_minutes, pm_minutes, real_codes, pm_codes)
+                assign = force_assign_unmatched_reals(assign, rt_minutes, pm_minutes)
+                used_pm = set(j for j in assign if j is not None)
+
+                for i in range(len(real_day)):
+                    r = real_day.iloc[i].copy()
+                    j = assign[i] if i < len(assign) else None
+                    if j is not None and j < len(pm_day):
+                        pm_row = pm_day.iloc[j]
+                        r["Code Ecran PM"] = pm_row["Code PM"]
+
+                        diff = None
+                        if rt_minutes[i] is not None:
+                            pm_min = pm_tv_minutes_tvday(pm_row.get("Code PM"), pm_row.get("PM_TV_MIN"))
+                            if pm_min < 10**9:
+                                diff = abs(rt_minutes[i] - pm_min)
+
+                        r["Commentaire"] = "Décalage" if (diff is not None and diff > DECALAGE_MINUTES) else None
+                    else:
+                        r["Code Ecran PM"] = None
+
+                        if backlog_by_support[sn] and rt_minutes[i] is not None:
+                            diffs = [abs(rt_minutes[i] - b) for b in backlog_by_support[sn]]
+                            best_k = int(pd.Series(diffs).idxmin()) if diffs else None
+
+                            if best_k is not None:
+                                best_diff = diffs[best_k]
+                                rt = rt_minutes[i]
+
+                                is_day_7_to_24 = (rt >= 7 * 60) and (rt < 24 * 60)
+                                is_after_24_to_7 = (rt >= 24 * 60) and (rt < (24 * 60 + 7 * 60))
+
+                                if best_diff <= COMPENSATION_NEAR_MINUTES:
+                                    r["Commentaire"] = "Compensation"
+                                    backlog_by_support[sn].pop(best_k)
+                                else:
+                                    if is_day_7_to_24:
+                                        r["Commentaire"] = "Compensation (loin)"
+                                        backlog_by_support[sn].pop(best_k)
+                                    elif is_after_24_to_7:
+                                        r["Commentaire"] = "Passage supplémentaire"
+                                    else:
+                                        r["Commentaire"] = "Passage supplémentaire"
+                            else:
+                                r["Commentaire"] = "Passage supplémentaire"
+                        else:
+                            r["Commentaire"] = "Passage supplémentaire"
+
+                    filled_rows.append(r)
+
+                remaining_pm = [idx for idx in range(len(pm_day)) if idx not in used_pm]
+                for j in remaining_pm:
+                    inserted_rows.append(insert_minimal_row_yumi(d, sup_display, pm_day.iloc[j]["Code PM"], pm_seq=j))
+                    pm_min = pm_tv_minutes_tvday(pm_day.iloc[j]["Code PM"], pm_day.iloc[j].get("PM_TV_MIN"))
+                    if pm_min < 10**9:
+                        backlog_by_support[sn].append(pm_min)
+
+            df_filled = pd.DataFrame(filled_rows) if filled_rows else pd.DataFrame()
+            df_insert = pd.DataFrame(inserted_rows) if inserted_rows else pd.DataFrame(columns=FINAL_COLUMNS_YUMI)
+
+            def sort_key_tv_yumi(row):
+                t = to_excel_time(row.get("H.Début"))
+                if t is not None:
+                    return real_tv_minutes(t)
+                return pm_tv_minutes_tvday(row.get("Code Ecran PM"), None)
+
+            if not df_filled.empty:
+                df_filled["_sort_t"] = df_filled.apply(lambda rr: sort_key_tv_yumi(rr), axis=1)
+                df_filled["Chaîne"] = sup_display
+                if "_pm_seq" not in df_filled.columns:
+                    df_filled["_pm_seq"] = 10**9
+            if not df_insert.empty:
+                df_insert["_sort_t"] = df_insert.apply(lambda rr: sort_key_tv_yumi(rr), axis=1)
+                if "_pm_seq" not in df_insert.columns:
+                    df_insert["_pm_seq"] = 10**9
+
+            out_day = pd.concat([x for x in [df_filled, df_insert] if not x.empty], ignore_index=True)
+            if not out_day.empty:
+                out_day = out_day.sort_values(["_sort_t", "_pm_seq"], na_position="last")
+                out_day = out_day.drop(columns=["_sort_t", "_pm_seq"], errors="ignore")
+
+            out_all.append(out_day[FINAL_COLUMNS_YUMI])
+
+    out_df = pd.concat(out_all, ignore_index=True) if out_all else df.copy()
+    out_df.drop(columns=["_real_code_digits"], inplace=True, errors="ignore")
+    return out_df[FINAL_COLUMNS_YUMI]
+
+# =========================
+# Styles + finalize
+# =========================
+def apply_row_style_from_template(style_row_cells, ws, row_idx, final_cols):
+    for c in range(1, len(final_cols) + 1):
+        src = style_row_cells[c - 1]
+        dst = ws.cell(row_idx, c)
+        dst._style = pycopy(src._style)
+        dst.number_format = src.number_format
+        dst.font = pycopy(src.font)
+        dst.fill = pycopy(src.fill)
+        dst.border = pycopy(src.border)
+        dst.alignment = pycopy(src.alignment)
+        dst.protection = pycopy(src.protection)
+
+def finalize_sheet(ws, style_row_cells, final_cols, total_col_name: str, mode: str):
+    ws["A6"].value = "Cible" if mode == "Suivi YUMI" else None
+
+    ws["B4"].value = date.today()
+    ws["B4"].number_format = "dd/mm/yyyy"
+
+    if mode == "Suivi YUMI":
+        ws["B5"].value = ws["F10"].value
+    else:
+        ws["B5"].value = ws["H10"].value
+
+    total_col_idx = final_cols.index(total_col_name) + 1 if total_col_name in final_cols else 4
+
+    last_data_row = 9
+    for r in range(ws.max_row, DATA_START_ROW - 1, -1):
+        if (ws.cell(r, 1).value not in (None, "")) or (ws.cell(r, 2).value not in (None, "")) or (ws.cell(r, total_col_idx).value not in (None, "")):
+            last_data_row = max(r, DATA_START_ROW)
+            break
+    if last_data_row < DATA_START_ROW:
+        last_data_row = DATA_START_ROW
+
+    total_row = last_data_row + 1
+    ws.insert_rows(total_row)
+    apply_row_style_from_template(style_row_cells, ws, total_row, final_cols)
+
+    ws.cell(total_row, 1).value = "Total"
+    ws.cell(total_row, 2).value = None
+
+    grey_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+    thin = Side(style="thin", color="000000")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def paint_grey_border(col_idx: int):
+        cell = ws.cell(total_row, col_idx)
+        if col_idx != 1:
+            cell.value = None
+        cell.fill = grey_fill
+        cell.border = thin_border
+        cell.font = pycopy(cell.font)
+        cell.font = cell.font.copy(bold=True)
+
+    paint_grey_border(1)
+    paint_grey_border(2)
+
+    if mode == "Suivi YUMI" and len(final_cols) >= 21:
+        paint_grey_border(20)
+        paint_grey_border(21)
+
+    empty_border = Border()
+    empty_fill = PatternFill(fill_type=None)
+
+    for col in range(3, len(final_cols) + 1):
+        if mode == "Suivi YUMI" and col in (20, 21):
+            continue
+        cell = ws.cell(total_row, col)
+        cell.value = None
+        cell.border = empty_border
+        cell.fill = empty_fill
+
+# =========================
+# Build workbooks
+# =========================
+def build_client_workbook_from_template(template_wb: openpyxl.Workbook, client_name: str, df_client: pd.DataFrame, final_cols: list, mode: str) -> bytes:
+    wb = template_wb
+    template_ws = wb.worksheets[0]
+    style_row_cells = [template_ws.cell(DATA_START_ROW, c) for c in range(1, len(final_cols) + 1)]
+
+    def reset_sheet(ws):
+        if ws.max_row > DATA_START_ROW:
+            ws.delete_rows(DATA_START_ROW + 1, ws.max_row - DATA_START_ROW)
+        for c in range(1, len(final_cols) + 1):
+            ws.cell(DATA_START_ROW, c).value = None
+        for c, col in enumerate(final_cols, start=1):
+            ws.cell(HEADER_ROW, c).value = col
+        ws.sheet_view.showGridLines = False
+
+    reset_sheet(template_ws)
+
+    if mode == "Suivi Imperium":
+        supports = list(df_client["supportp"].dropna().unique())
+        get_sub = lambda sup: df_client[df_client["supportp"] == sup].copy()
+        sheet_title = lambda sup: safe_sheet_name(f"{client_name} - {str(sup).strip()}")
+        total_col_name = "Code PM"
+    else:
+        supports = [s for s in df_client["Chaîne"].dropna().unique() if normalize_support(s) in ALLOWED_YUMI]
+        get_sub = lambda sup: df_client[df_client["Chaîne"] == sup].copy()
+        sheet_title = lambda sup: safe_sheet_name(f"{client_name} - {str(sup).strip()}")
+        total_col_name = "Code Ecran PM"
+
+    if not supports:
+        supports = ["Support"]
+
+    for sup in supports:
+        ws = wb.copy_worksheet(template_ws)
+        ws.title = sheet_title(sup)
+        reset_sheet(ws)
+
+        sub = get_sub(sup)
+
+        for i in range(len(sub)):
+            r_idx = DATA_START_ROW + i
+            if r_idx > DATA_START_ROW:
+                ws.insert_rows(r_idx)
+                apply_row_style_from_template(style_row_cells, ws, r_idx, final_cols)
+
+            for c, col in enumerate(final_cols, start=1):
+                val = sub.iloc[i][col] if col in sub.columns else None
+                if col in ("heure de diffusion", "H.Début", "H.Fin"):
+                    val = to_excel_time(val)
+                ws.cell(r_idx, c).value = val
+
+        finalize_sheet(ws, style_row_cells, final_cols, total_col_name=total_col_name, mode=mode)
+
+    wb.remove(template_ws)
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
 
 
-def update_slide_texts(slide_xml: bytes, updates: dict) -> bytes:
-    """Met à jour les zones de texte d'une slide par nom de shape."""
-    root = etree.fromstring(slide_xml)
-    for sp in root.findall(f".//{ptag('sp')}"):
-        nv = sp.find(f".//{ptag('cNvPr')}")
-        if nv is None: continue
-        name = nv.get("name","")
-        if name not in updates: continue
-        txBody = sp.find(f".//{ptag('txBody')}")
-        if txBody is None:
-            txBody = sp.find(f".//{atag('txBody')}")
-        if txBody is None: continue
-        _replace_tf_in_xml(txBody, updates[name])
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+# ══════════════════════════════════════════════════════════════
+# NAVIGATION PRINCIPALE — 3 onglets
+# Seul ajout par rapport à l'original : st.tabs + clés uniques
+# ══════════════════════════════════════════════════════════════
+st.title("📊 Pige & Media Review")
 
+tab1, tab2, tab3 = st.tabs([
+    "📋 Suivi Imperium",
+    "📺 Suivi YUMI",
+    "🎯 Media Review PPT",
+])
 
-def clone_media_slide(
-    template_bytes: dict,   # {filename: bytes} du zip original
-    media_code: str,
-    new_slide_num: int,
-    new_chart_base: int,    # numéro de départ pour les nouveaux charts
-    new_emb_base: int,      # numéro de départ pour les embeddings
-    calc: MediaCalculator,
-    comments: dict,
-    label: str,
-) -> dict:
-    """
-    Clone la slide OOH (slide4) en adaptant le contenu pour n'importe quel média.
-    Retourne un dict {path: bytes} des nouveaux fichiers à ajouter au zip.
-    """
-    new_files = {}
-    yl = calc.year_last
-    years = calc.years
-    years_range = f"{years[0]} – {yl}" if years else ""
-    media_label = MEDIA_LABELS.get(media_code, media_code)
-    media_short = MEDIA_SHORT.get(media_code, media_code)
+# ══════════════════════════════════════════════════════════════
+# ONGLET 1 — Suivi Imperium  (logique UI originale 100% intacte)
+# ══════════════════════════════════════════════════════════════
+with tab1:
+    st.subheader("Suivi Imperium")
+    st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Col A=Date | Col B=Ecran")
 
-    # Données du média
-    media_totals  = calc.total_focus_by_year(media_code)
-    top_ann       = calc.top_ann_focus_last(media_code, n=TOP_N_ANNONCEURS)
-    top_sup       = calc.split_support_last(media_code, n=TOP_N_SUPPORT)
+    template_ok = False
+    try:
+        _ = load_template_workbook("Suivi Imperium")
+        template_ok = True
+        st.success("Template OK ✅")
+    except Exception as e:
+        st.error(f"Template introuvable ❌ : {e}")
 
-    # Noms des nouveaux fichiers
-    new_slide_path   = f"ppt/slides/slide{new_slide_num}.xml"
-    new_slide_rels   = f"ppt/slides/_rels/slide{new_slide_num}.xml.rels"
-    chart_annual_id  = new_chart_base
-    chart_ann_id     = new_chart_base + 1
-    chart_pie_id     = new_chart_base + 2
-    emb_annual_id    = new_emb_base
-    emb_ann_id       = new_emb_base + 1
-    emb_pie_id       = new_emb_base + 2
+    data_in = st.file_uploader("1) Uploader DATA IMPERIUM", type=["xlsx"], key="imp_data")
+    pm_file = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"], key="imp_pm")
+    max_date_ui = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1), key="imp_date")
 
-    chart_annual_path = f"ppt/charts/chart{chart_annual_id}.xml"
-    chart_ann_path    = f"ppt/charts/chart{chart_ann_id}.xml"
-    chart_pie_path    = f"ppt/charts/chart{chart_pie_id}.xml"
-    emb_annual_path   = f"ppt/embeddings/Microsoft_Excel_Worksheet{emb_annual_id}.xlsx"
-    emb_ann_path      = f"ppt/embeddings/Microsoft_Excel_Worksheet{emb_ann_id}.xlsx"
-    emb_pie_path      = f"ppt/embeddings/Microsoft_Excel_Worksheet{emb_pie_id}.xlsx"
+    if st.button("Lancer la génération", use_container_width=True, disabled=(not template_ok), key="imp_btn"):
+        if not data_in:
+            st.warning("Upload DATA.")
+        elif not pm_file:
+            st.warning("Upload PM 2026.xlsx.")
+        else:
+            try:
+                with st.spinner("Génération en cours..."):
+                    df_in = pd.read_excel(data_in)
 
-    # ── Cloner chart7 → trend annuel ─────────────────────────────────
-    ch_annual_xml = template_bytes["ppt/charts/chart7.xml"]
-    cats_ann_yr = [int(y) for y in years]
-    vals_ann_yr = [media_totals.get(y,0) for y in years]
-    ch_annual_new = process_chart_media_annual(ch_annual_xml, cats_ann_yr, vals_ann_yr, media_label)
-    new_files[chart_annual_path] = ch_annual_new
+                    min_raw, max_raw = get_min_max_date_from_raw(df_in, "Suivi Imperium")
+                    if min_raw is None or max_raw is None:
+                        raise ValueError("Impossible de détecter min/max date dans la data brute.")
 
-    # ── Cloner chart8 → top annonceurs ───────────────────────────────
-    ch_ann_xml = template_bytes["ppt/charts/chart8.xml"]
-    ch_ann_new = process_chart_top_ann(ch_ann_xml,
-                                        list(top_ann.index), list(top_ann.values),
-                                        f"Top annonceurs {media_short} {int(yl)}")
-    new_files[chart_ann_path] = ch_ann_new
+                    date_min = min_raw
+                    date_max = min(max_date_ui, max_raw)
+                    st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
 
-    # ── Cloner chart9 → pie répartition support ───────────────────────
-    ch_pie_xml = template_bytes["ppt/charts/chart9.xml"]
-    sup_label = "ville" if media_code == "AF" else "support" if media_code in ("TV","PR") else "station"
-    ch_pie_new = process_chart_pie(ch_pie_xml,
-                                    list(top_sup.index), list(top_sup.values),
-                                    media_short)
-    new_files[chart_pie_path] = ch_pie_new
+                    df_all = build_final_df_from_imperium(df_in, date_min=date_min, date_max=date_max)
 
-    # ── Embeddings (copie des originaux — les charts XML sont la vraie source) ──
-    new_files[emb_annual_path] = template_bytes.get("ppt/embeddings/Microsoft_Excel_Worksheet6.xlsx", b"")
-    new_files[emb_ann_path]    = template_bytes.get("ppt/embeddings/Microsoft_Excel_Worksheet7.xlsx", b"")
-    new_files[emb_pie_path]    = template_bytes.get("ppt/embeddings/Microsoft_Excel_Worksheet8.xlsx", b"")
+                    known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
+                    pmv_all = read_pm_2026_workbook(pm_file.getvalue(), known_supports)
 
-    # ── Rels chart → embedding ────────────────────────────────────────
-    for chart_id, emb_id in [(chart_annual_id, emb_annual_id),
-                              (chart_ann_id,    emb_ann_id),
-                              (chart_pie_id,    emb_pie_id)]:
-        orig_rels = template_bytes[f"ppt/charts/_rels/chart7.xml.rels"]
-        rels_root = etree.fromstring(orig_rels)
-        RELS_NS2 = "http://schemas.openxmlformats.org/package/2006/relationships"
-        for rel in rels_root.findall(f"{{{RELS_NS2}}}Relationship"):
-            if "embeddings" in rel.get("Target",""):
-                rel.set("Target", f"../embeddings/Microsoft_Excel_Worksheet{emb_id}.xlsx")
-        new_files[f"ppt/charts/_rels/chart{chart_id}.xml.rels"] = etree.tostring(
-            rels_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                    client_files = {}
+                    for client_name in sorted(df_all["Marque"].dropna().unique()):
+                        df_client_raw = df_all[df_all["Marque"] == client_name].copy()
+                        client_norm = brand_key(client_name)
 
-    # ── Slide XML (clone de slide4) ───────────────────────────────────
-    slide4_xml = template_bytes["ppt/slides/slide4.xml"]
-    slide_root = etree.fromstring(slide4_xml)
+                        pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
+                        if pm_client.empty and not pmv_all.empty:
+                            pm_client = pmv_all[
+                                pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
+                            ].copy()
 
-    # Mettre à jour les rIds des graphicFrames
-    slide4_rels_xml = template_bytes["ppt/slides/_rels/slide4.xml.rels"]
-    orig_rels_root  = etree.fromstring(slide4_rels_xml)
-    RELS_NS2 = "http://schemas.openxmlformats.org/package/2006/relationships"
+                        df_client_done = fill_codepm_commentaire_per_client(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
 
-    # Mapping ancien rId chart → nouveau chart path
-    old_chart_map = {}
-    for rel in orig_rels_root.findall(f"{{{RELS_NS2}}}Relationship"):
-        if "charts/chart" in rel.get("Target",""):
-            old_chart_map[rel.get("Id")] = rel.get("Target")
+                        df_client_done = df_client_done.copy()
+                        for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
+                            df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
 
-    # Construire nouvelles rels
-    new_rels_root = etree.fromstring(slide4_rels_xml)
-    chart_assignments = {
-        "rId2": f"../charts/chart{chart_annual_id}.xml",  # trend annuel
-        "rId3": f"../charts/chart{chart_ann_id}.xml",     # top annonceurs
-        "rId4": f"../charts/chart{chart_pie_id}.xml",     # pie
-    }
-    for rel in new_rels_root.findall(f"{{{RELS_NS2}}}Relationship"):
-        rid = rel.get("Id")
-        if rid in chart_assignments:
-            rel.set("Target", chart_assignments[rid])
-    new_files[new_slide_rels] = etree.tostring(
-        new_rels_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                        template_wb = load_template_workbook("Suivi Imperium")
+                        xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, FINAL_COLUMNS_IMPERIUM, mode="Suivi Imperium")
+                        client_files[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
 
-    # Mettre à jour les textes de la slide
-    comment_key = f"slide_{media_code.lower()}"
-    sup_display_label = "ville" if media_code=="AF" else "support" if media_code in ("TV","PR") else "station"
-    text_updates = {
-        "TextBox 2":  f"Investissement média {media_label} — {label}",
-        "TextBox 3":  f"FY {years_range} | Millions MAD | Source : Imperium",
-        "TextBox 8":  f"Investissements {media_short}",
-        "TextBox 9":  f"Répartition {int(yl)} par {sup_display_label}",
-        "TextBox 10": f"Top annonceurs {media_short} (FY {int(yl)})",
-        "TextBox 11": "Points clés",
-        "TextBox 15": comments.get(comment_key, ""),
-    }
-    slide_bytes = update_slide_texts(etree.tostring(slide_root, xml_declaration=True,
-                                                     encoding="UTF-8", standalone=True),
-                                      text_updates)
-    new_files[new_slide_path] = slide_bytes
+                    st.session_state.client_files = client_files
+                    st.session_state.zip_bytes = make_zip(client_files)
+                    st.session_state.last_run_info = f"{len(client_files)} fichiers générés"
 
-    return new_files
+            except Exception as e:
+                st.error(f"Erreur: {e}")
 
-
-# ─────────────────────────────────────────────
-# 5. INJECTION PRINCIPALE
-# ─────────────────────────────────────────────
-
-class PPTInjector:
-    def __init__(self, template_path: str):
-        self.template_path = template_path
-        with open(template_path, "rb") as f:
-            self.template_bytes_raw = f.read()
-
-    def generate(self, calc: MediaCalculator, comments: dict,
-                 secteur: str, sous_secteur: str) -> bytes:
-
-        years      = calc.years
-        year_last  = calc.year_last
-        year_prev  = calc.year_prev
-        totals     = calc.total_by_year()
-        mm         = calc.total_by_year_media()
-        seas       = calc.seasonality_by_year()
-        label      = sous_secteur or secteur
-        yrange     = f"{years[0]} – {year_last}" if years else ""
-        medias     = calc.medias_present  # ex: ["AF","TV","PR","RD"]
-
-        # ── Lire tout le ZIP en mémoire ───────────────────────────────
-        original: dict[str, bytes] = {}
-        with zipfile.ZipFile(io.BytesIO(self.template_bytes_raw), "r") as zin:
-            for item in zin.infolist():
-                original[item.filename] = zin.read(item.filename)
-
-        # ── Préparer les mises à jour des charts statiques ────────────
-
-        # Chart1 — investissements annuels
-        ch1 = process_chart1_annual(
-            original["ppt/charts/chart1.xml"],
-            [int(y) for y in years],
-            [totals.get(y,0) for y in years]
+    if st.session_state.client_files:
+        st.success(st.session_state.last_run_info)
+        st.download_button(
+            "📦 Télécharger ZIP",
+            data=st.session_state.zip_bytes,
+            file_name=f"Suivis_Imperium_{max_date_ui.isoformat()}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="imp_zip"
         )
-
-        # Chart2 — stacked 100% par média
-        ch2 = process_chart2_stacked(original["ppt/charts/chart2.xml"], years, mm)
-
-        # Chart3 — saisonnalité mensuelle
-        ch3 = process_chart3_seasonality(original["ppt/charts/chart3.xml"], years, seas)
-
-        # Charts annonceurs slide3
-        years_ann = years[-3:] if len(years)>=3 else years  # 2023 gauche, 2024 milieu, 2025 droite
-        ch4 = ch5 = ch6 = None
-        for i, (chart_id, y) in enumerate(zip([4,5,6], years_ann + [None]*(3-len(years_ann)))):
-            if y is None: continue
-            top = calc.top_annonceurs_by_year(y, n=TOP_N_ANNONCEURS)
-            xml = process_chart_annonceurs(
-                original[f"ppt/charts/chart{chart_id}.xml"],
-                list(top.index), list(top.values), str(int(y))
-            )
-            if chart_id==4: ch4=xml
-            elif chart_id==5: ch5=xml
-            elif chart_id==6: ch6=xml
-
-        # Charts slides médias fixes (4=OOH/AF, 5=TV, 6=RD dans template)
-        # On les traite aussi
-        def make_media_charts(code, chart_annual_id, chart_pie_id, chart_ann_id):
-            mt = calc.total_focus_by_year(code)
-            ta = calc.top_ann_focus_last(code)
-            ts = calc.split_support_last(code)
-            media_label = MEDIA_LABELS.get(code, code)
-            ch_a = process_chart_media_annual(
-                original[f"ppt/charts/chart{chart_annual_id}.xml"],
-                [int(y) for y in years], [mt.get(y,0) for y in years], media_label
-            )
-            ch_p = process_chart_pie(
-                original[f"ppt/charts/chart{chart_pie_id}.xml"],
-                list(ts.index), list(ts.values), MEDIA_SHORT.get(code,code)
-            )
-            ch_n = process_chart_top_ann(
-                original[f"ppt/charts/chart{chart_ann_id}.xml"],
-                list(ta.index), list(ta.values), f"Top {MEDIA_SHORT.get(code,code)}"
-            )
-            return ch_a, ch_p, ch_n
-
-        # Slide4 = AF/OOH: chart7=annual, chart8=top ann, chart9=pie
-        ch7, ch9, ch8 = make_media_charts("AF", 7, 9, 8) if "AF" in medias else (
-            original["ppt/charts/chart7.xml"], original["ppt/charts/chart9.xml"], original["ppt/charts/chart8.xml"])
-
-        # Slide5 = TV: chart10=annual, chart11=pie, chart12=top ann
-        ch10, ch11, ch12 = make_media_charts("TV", 10, 11, 12) if "TV" in medias else (
-            original["ppt/charts/chart10.xml"], original["ppt/charts/chart11.xml"], original["ppt/charts/chart12.xml"])
-
-        # Slide6 = RD: chart15=annual, chart13=pie, chart14=top ann
-        ch15, ch13, ch14 = make_media_charts("RD", 15, 13, 14) if "RD" in medias else (
-            original["ppt/charts/chart15.xml"], original["ppt/charts/chart13.xml"], original["ppt/charts/chart14.xml"])
-
-        # ── Textes slides fixes ───────────────────────────────────────
-        slide_texts = {
-            "ppt/slides/slide1.xml": {
-                "Title 1": f"Media Review\n{label}\n| {yrange}",
-            },
-            "ppt/slides/slide2.xml": {
-                "Text 0": f"Investissements média — {label}",
-                "Text 1": f"{yrange} | Millions MAD | Source : Imperium",
-                "Text 3": comments.get("slide2_headline","") + "\n\n" + comments.get("slide2_global",""),
-            },
-            "ppt/slides/slide3.xml": {
-                "TextBox 1": f"Investissement média par annonceur — {label}",
-                "TextBox 2": f"Classement annonceurs | Millions MAD | {' - '.join(str(int(y)) for y in years[-3:])} | Source : Imperium",
-                "ZoneTexte 10": comments.get("slide3_annonceurs",""),
-            },
-            "ppt/slides/slide4.xml": {
-                "TextBox 2": f"Investissement média AF (OOH) — {label}",
-                "TextBox 3": f"FY {yrange} | Millions MAD | Source : Imperium",
-                "TextBox 9": f"Répartition {int(year_last)} par ville",
-                "TextBox 10": f"Top annonceurs OOH (FY {int(year_last)})",
-                "TextBox 15": comments.get("slide_af",""),
-            },
-            "ppt/slides/slide5.xml": {
-                "TextBox 2": f"Investissement média TV — {label}",
-                "TextBox 3": f"FY {yrange} | Millions MAD | Source : Imperium",
-                "TextBox 8": "Investissements TV",
-                "TextBox 9": f"Répartition {int(year_last)} par support",
-                "TextBox 10": f"Top annonceurs TV (FY {int(year_last)})",
-                "TextBox 15": comments.get("slide_tv",""),
-            },
-            "ppt/slides/slide6.xml": {
-                "TextBox 1": f"Investissement média Radio — {label}",
-                "TextBox 2": f"{yrange} | Millions MAD | Source : Imperium",
-                "TextBox 7": "Investissements Radio",
-                "TextBox 8": f"Split par station — FY {int(year_last)}",
-                "TextBox 9": f"Top annonceurs RD — FY {int(year_last)}",
-                "TextBox 14": comments.get("slide_rd",""),
-            },
-        }
-
-        # ── Slides supplémentaires pour médias hors AF/TV/RD ──────────
-        extra_medias = [m for m in medias if m not in ("AF","TV","RD")]
-        extra_files: dict[str, bytes] = {}
-        extra_slide_ids = []  # (slide_num, slide_path)
-
-        next_slide_num = 7
-        next_chart_id  = 16
-        next_emb_id    = 15
-
-        for media_code in extra_medias:
-            cloned = clone_media_slide(
-                original, media_code, next_slide_num,
-                next_chart_id, next_emb_id,
-                calc, comments, label
-            )
-            extra_files.update(cloned)
-            extra_slide_ids.append((next_slide_num, f"ppt/slides/slide{next_slide_num}.xml"))
-            next_slide_num += 3
-            next_chart_id  += 3
-            next_emb_id    += 3
-
-        # ── Construire le nouveau ZIP ─────────────────────────────────
-        chart_updates = {
-            "ppt/charts/chart1.xml": ch1,
-            "ppt/charts/chart2.xml": ch2,
-            "ppt/charts/chart3.xml": ch3,
-            "ppt/charts/chart7.xml": ch7,
-            "ppt/charts/chart8.xml": ch8,
-            "ppt/charts/chart9.xml": ch9,
-            "ppt/charts/chart10.xml": ch10,
-            "ppt/charts/chart11.xml": ch11,
-            "ppt/charts/chart12.xml": ch12,
-            "ppt/charts/chart13.xml": ch13,
-            "ppt/charts/chart14.xml": ch14,
-            "ppt/charts/chart15.xml": ch15,
-        }
-        if ch4: chart_updates["ppt/charts/chart4.xml"] = ch4
-        if ch5: chart_updates["ppt/charts/chart5.xml"] = ch5
-        if ch6: chart_updates["ppt/charts/chart6.xml"] = ch6
-
-        out_zip = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(self.template_bytes_raw), "r") as zin:
-            with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
-                for item in zin.infolist():
-                    data = zin.read(item.filename)
-
-                    if item.filename in chart_updates:
-                        data = chart_updates[item.filename]
-                    elif item.filename in slide_texts:
-                        try: data = update_slide_texts(data, slide_texts[item.filename])
-                        except: pass
-
-                    # Mettre à jour presentation.xml si slides extra
-                    elif item.filename == "ppt/presentation.xml" and extra_slide_ids:
-                        data = _add_slides_to_presentation(data, extra_slide_ids)
-
-                    # Mettre à jour [Content_Types].xml si slides extra
-                    elif item.filename == "[Content_Types].xml" and extra_slide_ids:
-                        data = _add_content_types(data, extra_slide_ids)
-
-                    # Mettre à jour ppt/_rels/presentation.xml.rels si slides extra
-                    elif item.filename == "ppt/_rels/presentation.xml.rels" and extra_slide_ids:
-                        data = _add_prs_rels(data, extra_slide_ids)
-
-                    zout.writestr(item, data)
-
-                # Ajouter les nouveaux fichiers (slides extra + leurs charts + rels)
-                for path, content in extra_files.items():
-                    zout.writestr(path, content)
-
-        return out_zip.getvalue()
+        st.divider()
+        cols = st.columns(3)
+        for i, (fname, data) in enumerate(st.session_state.client_files.items()):
+            with cols[i % 3]:
+                st.download_button(
+                    f"📥 {fname}",
+                    data=data,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"imp_dl_{i}"
+                )
 
 
-def _add_slides_to_presentation(prs_xml: bytes, extra_slide_ids: list) -> bytes:
-    """Ajoute les nouvelles slides dans sldIdLst de presentation.xml."""
-    root = etree.fromstring(prs_xml)
-    PRS_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
-    sld_id_lst = root.find(f"{{{PRS_NS}}}sldIdLst")
-    if sld_id_lst is None:
-        return prs_xml
+# ══════════════════════════════════════════════════════════════
+# ONGLET 2 — Suivi YUMI  (logique UI originale 100% intacte)
+# ══════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("Suivi YUMI")
+    st.caption("PM unique : 1 feuille = 1 client + 1 chaîne | Chaînes : 2M & ALAOULA")
 
-    # Trouver le max id existant
-    max_id = max(int(s.get("id",256)) for s in sld_id_lst) + 1
+    template_ok_y = False
+    try:
+        _ = load_template_workbook("Suivi YUMI")
+        template_ok_y = True
+        st.success("Template YUMI OK ✅")
+    except Exception as e:
+        st.error(f"Template introuvable ❌ : {e}")
 
-    for slide_num, _ in extra_slide_ids:
-        sld_id = etree.SubElement(sld_id_lst, f"{{{PRS_NS}}}sldId")
-        sld_id.set("id", str(max_id))
-        sld_id.set(f"{{{RNS}}}id", f"rId_extra_{slide_num}")
-        max_id += 1
+    data_in_y = st.file_uploader("1) Uploader DATA YUMI", type=["xlsx"], key="yumi_data")
+    pm_file_y = st.file_uploader("2) Uploader PM 2026 (1 fichier)", type=["xlsx"], key="yumi_pm")
+    max_date_y = st.date_input("3) Date max (N-1 par défaut)", value=date.today() - timedelta(days=1), key="yumi_date")
 
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    if st.button("Lancer la génération YUMI", use_container_width=True, disabled=(not template_ok_y), key="yumi_btn"):
+        if not data_in_y:
+            st.warning("Upload DATA.")
+        elif not pm_file_y:
+            st.warning("Upload PM 2026.xlsx.")
+        else:
+            try:
+                with st.spinner("Génération en cours..."):
+                    df_in = pd.read_excel(data_in_y)
+
+                    min_raw, max_raw = get_min_max_date_from_raw(df_in, "Suivi YUMI")
+                    if min_raw is None or max_raw is None:
+                        raise ValueError("Impossible de détecter min/max date dans la data brute.")
+
+                    date_min = min_raw
+                    date_max = min(max_date_y, max_raw)
+                    st.info(f"Fenêtre dates utilisée: {date_min} → {date_max} (bornée par la data brute)")
+
+                    df_all = build_final_df_from_yumi(df_in, date_min=date_min, date_max=date_max)
+                    df_all = df_all[df_all["support_norm"].isin(ALLOWED_YUMI)].copy()
+
+                    known_supports = set(df_all["support_norm"].dropna().unique()) | {"2M", "MBC5", "ALAOULA"}
+                    pmv_all = read_pm_2026_workbook(pm_file_y.getvalue(), known_supports)
+
+                    client_files_y = {}
+                    for client_name in sorted(df_all["Marque"].dropna().unique()):
+                        df_client_raw = df_all[df_all["Marque"] == client_name].copy()
+                        client_norm = brand_key(client_name)
+
+                        pm_client = pmv_all[pmv_all["PM_FILE_BRAND_N"] == client_norm].copy()
+                        if pm_client.empty and not pmv_all.empty:
+                            pm_client = pmv_all[
+                                pmv_all["PM_FILE_BRAND_N"].apply(lambda x: (x in client_norm) or (client_norm in x))
+                            ].copy()
+
+                        df_client_done = fill_codeecranpm_commentaire_per_client_yumi(df_client_raw, pm_client, date_min=date_min, date_max=date_max)
+
+                        df_client_done = df_client_done.copy()
+                        for helper in ("support_norm", "Marque_norm", "date_only", "t_real", "_real_code_digits", "_pm_seq"):
+                            df_client_done.drop(columns=[helper], inplace=True, errors="ignore")
+
+                        template_wb = load_template_workbook("Suivi YUMI")
+                        xlsx_bytes = build_client_workbook_from_template(template_wb, client_name, df_client_done, FINAL_COLUMNS_YUMI, mode="Suivi YUMI")
+                        client_files_y[f"Suivi_{client_name}.xlsx"] = xlsx_bytes
+
+                    st.session_state.client_files_yumi = client_files_y
+                    st.session_state.zip_bytes_yumi = make_zip(client_files_y)
+                    st.session_state.last_run_yumi = f"{len(client_files_y)} fichiers YUMI générés"
+
+            except Exception as e:
+                st.error(f"Erreur: {e}")
+
+    if st.session_state.client_files_yumi:
+        st.success(st.session_state.last_run_yumi)
+        st.download_button(
+            "📦 Télécharger ZIP YUMI",
+            data=st.session_state.zip_bytes_yumi,
+            file_name=f"Suivis_YUMI_{max_date_y.isoformat()}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="yumi_zip"
+        )
+        st.divider()
+        cols = st.columns(3)
+        for i, (fname, data) in enumerate(st.session_state.client_files_yumi.items()):
+            with cols[i % 3]:
+                st.download_button(
+                    f"📥 {fname}",
+                    data=data,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"yumi_dl_{i}"
+                )
 
 
-def _add_content_types(ct_xml: bytes, extra_slide_ids: list) -> bytes:
-    """Ajoute les Content-Types pour les nouvelles slides."""
-    root = etree.fromstring(ct_xml)
-    SLIDE_CT = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml"
-    for slide_num, slide_path in extra_slide_ids:
-        # Vérifier si déjà présent
-        existing = [el for el in root if el.get("PartName") == f"/{slide_path}"]
-        if not existing:
-            override = etree.SubElement(root, f"{{{CTNS}}}Override")
-            override.set("PartName", f"/{slide_path}")
-            override.set("ContentType", SLIDE_CT)
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-
-
-def _add_prs_rels(rels_xml: bytes, extra_slide_ids: list) -> bytes:
-    """Ajoute les relations dans ppt/_rels/presentation.xml.rels."""
-    root = etree.fromstring(rels_xml)
-    RELS_NS2 = "http://schemas.openxmlformats.org/package/2006/relationships"
-    SLIDE_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
-    for slide_num, slide_path in extra_slide_ids:
-        rid = f"rId_extra_{slide_num}"
-        rel = etree.SubElement(root, f"{{{RELS_NS2}}}Relationship")
-        rel.set("Id", rid)
-        rel.set("Type", SLIDE_TYPE)
-        rel.set("Target", slide_path.replace("ppt/",""))
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+# ══════════════════════════════════════════════════════════════
+# ONGLET 3 — Media Review PPT
+# ══════════════════════════════════════════════════════════════
+with tab3:
+    try:
+        from streamlit_ppt_module import render_ppt_module
+        render_ppt_module()
+    except ImportError as e:
+        st.error(f"Module PPT introuvable : {e}")
+        st.info("Vérifiez que `streamlit_ppt_module.py` et `ppt_engine.py` sont dans le même dossier que `app.py`.")
