@@ -95,7 +95,12 @@ class MediaCalculator:
         if secteur_filter:
             df_f = df_f[df_f["Secteur"].str.strip() == secteur_filter.strip()]
         if sous_secteur_filter:
-            df_f = df_f[df_f["SousSecteur"].str.strip() == sous_secteur_filter.strip()]
+            # Accepte une string OU une liste de strings
+            if isinstance(sous_secteur_filter, list):
+                ss_list = [s.strip() for s in sous_secteur_filter]
+                df_f = df_f[df_f["SousSecteur"].str.strip().isin(ss_list)]
+            else:
+                df_f = df_f[df_f["SousSecteur"].str.strip() == sous_secteur_filter.strip()]
         self.df = df_f.copy()
 
         self.years      = sorted(self.df["Anp"].dropna().unique().tolist())
@@ -552,22 +557,26 @@ def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFr
         # Nom de la série
         _set_series_name(new_ser, m)
 
-        # Valeurs (en millions pour cohérence avec embedding)
-        vals = [media_matrix.loc[y, m] if y in media_matrix.index else 0 for y in years]
-        vals_clean = [v if v and v > 0 else None for v in vals]
-        _rebuild_cache(new_ser, [int(y) for y in years], vals_clean, divide_by=1e6)
+        # Valeurs = POURCENTAGES (0.048 = 4.8%) — cohérent avec l'embedding
+        row_totals = [media_matrix.loc[y].sum() if y in media_matrix.index else 0 for y in years]
+        vals_pct = [
+            media_matrix.loc[y, m] / row_totals[i] if row_totals[i] > 0 else 0
+            for i, y in enumerate(years)
+        ]
+        vals_clean = [v if v and v > 0 else None for v in vals_pct]
+        _rebuild_cache(new_ser, [int(y) for y in years], vals_clean, divide_by=1.0)
 
         # ── Corriger les formules avec la bonne lettre de colonne ──
         _fix_stacked_formulas(new_ser, idx, n_years)
 
-        # dLbls : afficher % centré dans la barre
+        # dLbls : showVal=1 avec formatCode 0% → affiche "4.8%" etc.
         dlbls = new_ser.find(ctag("dLbls"))
         if dlbls is None: dlbls = etree.SubElement(new_ser, ctag("dLbls"))
         for child in list(dlbls): dlbls.remove(child)
         nf = etree.SubElement(dlbls, ctag("numFmt"))
         nf.set("formatCode", "0%"); nf.set("sourceLinked", "0")
-        for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
-                         ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
+        for tag, val in [("showLegendKey","0"),("showVal","1"),("showCatName","0"),
+                         ("showSerName","0"),("showPercent","0"),("showBubbleSize","0")]:
             etree.SubElement(dlbls, ctag(tag)).set("val", val)
 
         if insert_before is not None:
@@ -582,8 +591,8 @@ def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFr
     etree.SubElement(gdlbls, ctag("dLblPos")).set("val", "ctr")
     nf = etree.SubElement(gdlbls, ctag("numFmt"))
     nf.set("formatCode", "0%"); nf.set("sourceLinked", "0")
-    for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
-                     ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
+    for tag, val in [("showLegendKey","0"),("showVal","1"),("showCatName","0"),
+                     ("showSerName","0"),("showPercent","0"),("showBubbleSize","0")]:
         etree.SubElement(gdlbls, ctag(tag)).set("val", val)
 
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
@@ -775,16 +784,25 @@ def _xlsx_multi(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
 
 
 def _xlsx_stacked(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
-    """Workbook stacked bar (mix médias) — from scratch, sans cellules fantômes."""
+    """
+    Workbook stacked 100% — stocke les POURCENTAGES (0.048 = 4.8%) directement.
+    Ainsi PowerPoint affiche les % sans recalculer depuis les valeurs absolues.
+    """
     wb, ws = _make_clean_workbook(emb_bytes)
     ws.cell(1, 1).value = "Colonne1"
     for j, name in enumerate(series_dict.keys()):
         ws.cell(1, j + 2).value = name
+    # Calculer les totaux par ligne (année) pour normaliser en %
+    n_rows = len(cats)
+    n_series = len(series_dict)
+    raw = list(series_dict.values())  # list of lists [série0_vals, série1_vals, ...]
     for i, cat in enumerate(cats):
         ws.cell(i + 2, 1).value = cat
+        row_total = sum(raw[j][i] if i < len(raw[j]) else 0 for j in range(n_series))
         for j, (name, vals) in enumerate(series_dict.items()):
             v = vals[i] if i < len(vals) else 0
-            ws.cell(i + 2, j + 2).value = round(float(v or 0), 2)
+            pct = round(float(v) / float(row_total), 6) if row_total else 0
+            ws.cell(i + 2, j + 2).value = pct
     out = io.BytesIO(); wb.save(out); return out.getvalue()
 
 
@@ -878,7 +896,7 @@ class PPTInjector:
         if p and b:
             media_present_list = [m for m in ["AF","PR","RD","TV","CN"]
                                    if m in mm.columns and mm[m].sum() > 0]
-            stacked_data = {m: [round((mm.loc[y, m] if y in mm.index else 0) / 1e6, 4) for y in years]
+            stacked_data = {m: [float(mm.loc[y, m]) if y in mm.index else 0.0 for y in years]
                             for m in media_present_list}
             excel_updates[p] = _xlsx_stacked(b, [int(y) for y in years], stacked_data)
 
