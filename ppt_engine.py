@@ -811,17 +811,17 @@ class PPTInjector:
         p, b = _emb(1)
         if p and b:
             excel_updates[p] = _xlsx_simple(b, [int(y) for y in years],
-                                             [totals.get(y, 0) for y in years], "Total")
+                                             [totals.get(y, 0) / 1e6 for y in years], "Total (M MAD)")
         p, b = _emb(2)
         if p and b:
-            month_data = {str(int(y)): [seas.loc[y, m] if y in seas.index and m in seas.columns else 0
+            month_data = {str(int(y)): [round((seas.loc[y, m] if y in seas.index and m in seas.columns else 0) / 1e6, 4)
                                          for m in range(1, 13)] for y in years}
             excel_updates[p] = _xlsx_multi(b, MONTHS_FR, month_data)
         p, b = _emb(3)
         if p and b:
             media_present_list = [m for m in ["AF","PR","RD","TV","CN"]
                                    if m in mm.columns and mm[m].sum() > 0]
-            stacked_data = {m: [mm.loc[y, m] if y in mm.index else 0 for y in years]
+            stacked_data = {m: [round((mm.loc[y, m] if y in mm.index else 0) / 1e6, 4) for y in years]
                             for m in media_present_list}
             excel_updates[p] = _xlsx_stacked(b, [int(y) for y in years], stacked_data)
 
@@ -837,7 +837,7 @@ class PPTInjector:
             chart_updates[f"ppt/charts/chart{chart_id}.xml"] = xml
             p, b = _emb(chart_id)
             if p and b:
-                excel_updates[p] = _xlsx_simple(b, list(top.index), list(top.values), str(int(y)))
+                excel_updates[p] = _xlsx_simple(b, list(top.index), [v / 1e6 for v in top.values], str(int(y)))
 
         # Texts slides 1-3
         slide_texts = {
@@ -903,9 +903,9 @@ class PPTInjector:
             p_pie, b_pie = _emb(cid_pie)
             p_top, b_top = _emb(cid_topann)
             emb_annual = _xlsx_simple(b_ann, [int(y) for y in years],
-                                       [mt.get(y, 0) for y in years], media_short) if b_ann else None
-            emb_pie    = _xlsx_simple(b_pie, list(ts.index), list(ts.values), media_short) if b_pie else None
-            emb_topann = _xlsx_simple(b_top, list(ta.index), list(ta.values), media_short) if b_top else None
+                                       [mt.get(y, 0) / 1e6 for y in years], media_short) if b_ann else None
+            emb_pie    = _xlsx_simple(b_pie, list(ts.index), [v / 1e6 for v in ts.values], media_short) if b_pie else None
+            emb_topann = _xlsx_simple(b_top, list(ta.index), [v / 1e6 for v in ta.values], media_short) if b_top else None
 
             media_chart_data[code] = {
                 "template_slide": template_slide_num,
