@@ -99,18 +99,24 @@ def render_ppt_module():
         with col_b:
             if "SousSecteur" in df_raw.columns and secteur_sel:
                 df_sect = df_raw[df_raw["Secteur"] == secteur_sel]
-                sous_secteurs = ["(Secteur entier)"] + sorted(df_sect["SousSecteur"].dropna().unique().tolist())
+                sous_secteurs_available = sorted(df_sect["SousSecteur"].dropna().unique().tolist())
             else:
-                sous_secteurs = ["(Secteur entier)"]
-            sous_sel = st.selectbox("Sous-secteur", sous_secteurs, key="ppt_sous_secteur")
-            sous_secteur_val = None if sous_sel == "(Secteur entier)" else sous_sel
+                sous_secteurs_available = []
+            sous_sel = st.multiselect(
+                "Sous-secteur(s)",
+                sous_secteurs_available,
+                placeholder="Laisser vide = secteur entier",
+                key="ppt_sous_secteur"
+            )
+            # Liste vide = secteur entier ; sinon liste de sous-secteurs sélectionnés
+            sous_secteur_val = sous_sel if sous_sel else None
 
         with col_c:
             # Années disponibles (preview)
             if secteur_sel:
                 df_preview = df_raw[df_raw["Secteur"] == secteur_sel]
                 if sous_secteur_val:
-                    df_preview = df_preview[df_preview["SousSecteur"] == sous_secteur_val]
+                    df_preview = df_preview[df_preview["SousSecteur"].isin(sous_secteur_val)]
                 years_available = sorted(df_preview["Anp"].dropna().unique().tolist()) if "Anp" in df_preview.columns else []
                 st.info(f"📅 Années détectées : {', '.join(str(y) for y in years_available)}")
 
@@ -169,7 +175,12 @@ def render_ppt_module():
                     # Commentaires IA
                     progress.progress(50, text="🤖 Génération des commentaires IA...")
                     from ppt_engine import generate_comments_via_claude
-                    label = sous_secteur_val or secteur_sel
+                    if sous_secteur_val and len(sous_secteur_val) == 1:
+                        label = sous_secteur_val[0]
+                    elif sous_secteur_val and len(sous_secteur_val) > 1:
+                        label = " + ".join(sous_secteur_val)
+                    else:
+                        label = secteur_sel
                     effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
                     comments = generate_comments_via_claude(stats, secteur_sel, label, effective_api_key)
 
