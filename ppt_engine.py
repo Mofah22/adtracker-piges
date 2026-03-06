@@ -669,26 +669,43 @@ def update_slide_texts(slide_xml: bytes, updates: dict) -> bytes:
 # ═══════════════════════════════════════════════════════════════
 # 5. HELPERS EXCEL EMBARQUÉS
 # ═══════════════════════════════════════════════════════════════
-def _xlsx_simple(emb_bytes: bytes, cats: list, vals: list, col_header: str = "Valeur") -> bytes:
+def _make_clean_workbook(emb_bytes: bytes) -> "openpyxl.Workbook":
+    """
+    Crée un workbook propre en partant du template mais avec une feuille entièrement
+    réinitialisée — supprime toutes les cellules existantes pour éviter les cellules
+    fantômes qui corrompent les charts quand PowerPoint recalcule.
+    """
     import openpyxl as _xl
-    wb = _xl.load_workbook(io.BytesIO(emb_bytes))
+    from openpyxl import Workbook
+    wb_orig = _xl.load_workbook(io.BytesIO(emb_bytes))
+    sheet_name = wb_orig.active.title  # conserver le nom de feuille original ("Sheet1")
+
+    wb = Workbook()
     ws = wb.active
-    for row in ws.iter_rows():
-        for cell in row: cell.value = None
+    ws.title = sheet_name
+
+    # Désactiver fullCalcOnLoad : empêche PowerPoint de recalculer depuis les formules
+    # et d'écraser le cache avec les données du template
+    wb.calculation.fullCalcOnLoad = False
+    wb.calculation.calcOnSave = False
+
+    return wb, ws
+
+
+def _xlsx_simple(emb_bytes: bytes, cats: list, vals: list, col_header: str = "Valeur") -> bytes:
+    """Workbook 2 colonnes : catégories | valeurs — from scratch, sans cellules fantômes."""
+    wb, ws = _make_clean_workbook(emb_bytes)
     ws.cell(1, 1).value = ""
     ws.cell(1, 2).value = col_header
     for i, (cat, val) in enumerate(zip(cats, vals)):
         ws.cell(i + 2, 1).value = cat
-        ws.cell(i + 2, 2).value = round(val, 2) if val else 0
+        ws.cell(i + 2, 2).value = round(float(val), 2) if val is not None else 0
     out = io.BytesIO(); wb.save(out); return out.getvalue()
 
 
 def _xlsx_multi(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
-    import openpyxl as _xl
-    wb = _xl.load_workbook(io.BytesIO(emb_bytes))
-    ws = wb.active
-    for row in ws.iter_rows():
-        for cell in row: cell.value = None
+    """Workbook multi-séries (saisonnalité) — from scratch, sans cellules fantômes."""
+    wb, ws = _make_clean_workbook(emb_bytes)
     ws.cell(1, 1).value = ""
     for j, name in enumerate(series_dict.keys()):
         ws.cell(1, j + 2).value = str(name)
@@ -696,16 +713,13 @@ def _xlsx_multi(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
         ws.cell(i + 2, 1).value = cat
         for j, vals in enumerate(series_dict.values()):
             v = vals[i] if i < len(vals) else 0
-            ws.cell(i + 2, j + 2).value = round(v, 2) if v else 0
+            ws.cell(i + 2, j + 2).value = round(float(v), 2) if v is not None else 0
     out = io.BytesIO(); wb.save(out); return out.getvalue()
 
 
 def _xlsx_stacked(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
-    import openpyxl as _xl
-    wb = _xl.load_workbook(io.BytesIO(emb_bytes))
-    ws = wb.active
-    for row in ws.iter_rows():
-        for cell in row: cell.value = None
+    """Workbook stacked bar (mix médias) — from scratch, sans cellules fantômes."""
+    wb, ws = _make_clean_workbook(emb_bytes)
     ws.cell(1, 1).value = "Colonne1"
     for j, name in enumerate(series_dict.keys()):
         ws.cell(1, j + 2).value = name
@@ -713,7 +727,7 @@ def _xlsx_stacked(emb_bytes: bytes, cats: list, series_dict: dict) -> bytes:
         ws.cell(i + 2, 1).value = cat
         for j, (name, vals) in enumerate(series_dict.items()):
             v = vals[i] if i < len(vals) else 0
-            ws.cell(i + 2, j + 2).value = round(v or 0, 2)
+            ws.cell(i + 2, j + 2).value = round(float(v or 0), 2)
     out = io.BytesIO(); wb.save(out); return out.getvalue()
 
 
@@ -922,15 +936,24 @@ class PPTInjector:
         template_media_slides = {4, 5, 6, 7, 8}
         slides_to_skip = set()
 
-        # Slides médias absentes de la data → supprimer du template
+        # Slides médias absentes de la data → supprimer slide + charts + embeddings
         for tslide, (code, *_) in TEMPLATE_SLIDE_MAP.items():
             if code not in medias:
                 slides_to_skip.add(f"ppt/slides/slide{tslide}.xml")
                 slides_to_skip.add(f"ppt/slides/_rels/slide{tslide}.xml.rels")
-                # Charts de cette slide aussi
+                # Supprimer aussi les charts et leurs embeddings (orphelins sinon)
                 chart_map = _slide_chart_map(tslide)
                 for cnum in chart_map.values():
                     slides_to_skip.add(f"ppt/charts/chart{cnum}.xml")
+                    slides_to_skip.add(f"ppt/charts/_rels/chart{cnum}.xml.rels")
+                    # Trouver l'embedding lié à ce chart
+                    rels_path = f"ppt/charts/_rels/chart{cnum}.xml.rels"
+                    if rels_path in original:
+                        rels_root = etree.fromstring(original[rels_path])
+                        for rel in rels_root:
+                            if "embedding" in rel.get("Target", ""):
+                                emb_name = rel.get("Target", "").split("/")[-1]
+                                slides_to_skip.add(f"ppt/embeddings/{emb_name}")
 
         # Les slides médias présentes gardent leurs numéros de template pour l'instant
         # On génère le texte pour chaque
