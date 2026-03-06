@@ -40,6 +40,54 @@ def find_templates() -> dict[str, str]:
     return templates
 
 # ─────────────────────────────────────────────
+# FONCTIONS CACHÉES — évitent les recalculs
+# ─────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _load_dataframe(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """Charge le DataFrame une seule fois — mis en cache par contenu du fichier."""
+    if file_name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+    return pd.read_excel(io.BytesIO(file_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def _load_template(template_path: str) -> bytes:
+    """Lit le template PPT une seule fois — mis en cache par chemin."""
+    with open(template_path, "rb") as f:
+        return f.read()
+
+
+@st.cache_data(show_spinner=False)
+def _compute_stats(
+    file_bytes: bytes, file_name: str,
+    secteur: str, sous_secteurs: tuple  # tuple pour être hashable
+) -> dict:
+    """Calcule les stats agrégées — recalcul uniquement si les filtres changent."""
+    from ppt_engine import MediaCalculator
+    df = _load_dataframe(file_bytes, file_name)
+    ss = list(sous_secteurs) if sous_secteurs else None
+    calc = MediaCalculator(df, secteur, ss)
+    return calc.summary_stats()
+
+
+@st.cache_data(show_spinner=False)
+def _get_medias_and_totals(
+    file_bytes: bytes, file_name: str,
+    secteur: str, sous_secteurs: tuple
+) -> dict:
+    """Retourne totaux par année + médias présents pour l'aperçu."""
+    from ppt_engine import MediaCalculator
+    df = _load_dataframe(file_bytes, file_name)
+    ss = list(sous_secteurs) if sous_secteurs else None
+    calc = MediaCalculator(df, secteur, ss)
+    return {
+        "totals": calc.total_by_year(),
+        "years": calc.years,
+        "medias": calc.medias_present,
+    }
+
+# ─────────────────────────────────────────────
 # RENDER FUNCTION (intégrable)
 # ─────────────────────────────────────────────
 
@@ -75,12 +123,11 @@ def render_ppt_module():
 
     # ── Chargement DATA ───────────────────────────────────────────────
     df_raw = None
+    file_bytes = None
     if data_file:
         try:
-            if data_file.name.endswith(".csv"):
-                df_raw = pd.read_csv(data_file)
-            else:
-                df_raw = pd.read_excel(data_file)
+            file_bytes = data_file.read()
+            df_raw = _load_dataframe(file_bytes, data_file.name)
             st.success(f"✅ DATA chargée : {len(df_raw):,} lignes | Colonnes : {list(df_raw.columns[:6])}…")
         except Exception as e:
             st.error(f"Erreur chargement DATA : {e}")
@@ -120,11 +167,12 @@ def render_ppt_module():
                 years_available = sorted(df_preview["Anp"].dropna().unique().tolist()) if "Anp" in df_preview.columns else []
                 st.info(f"📅 Années détectées : {', '.join(str(y) for y in years_available)}")
 
-        # Preview stats rapides
-        if secteur_sel:
+        # Preview stats rapides — via cache (pas de recalcul si filtres inchangés)
+        if secteur_sel and file_bytes is not None:
             try:
-                calc_preview = MediaCalculator(df_raw, secteur_sel, sous_secteur_val)
-                totals = calc_preview.total_by_year()
+                ss_tuple = tuple(sous_secteur_val) if sous_secteur_val else ()
+                preview = _get_medias_and_totals(file_bytes, data_file.name, secteur_sel, ss_tuple)
+                totals = preview["totals"]
                 if totals:
                     st.markdown("**Aperçu investissements :**")
                     cols_prev = st.columns(len(totals))
@@ -160,34 +208,39 @@ def render_ppt_module():
                 st.warning("Sélectionnez un secteur.")
                 return
 
-            with st.spinner("Génération en cours… Calculs + Commentaires IA + Injection PPT"):
+            with st.spinner("Génération en cours… Commentaires IA + Injection PPT"):
                 progress = st.progress(0, text="Calcul des agrégats...")
 
                 try:
-                    # Calculs
-                    progress.progress(20, text="📊 Calcul des agrégats...")
-                    calc = MediaCalculator(df_raw, secteur_sel, sous_secteur_val)
+                    # Calculs — via cache si déjà fait avec ce filtre
+                    progress.progress(15, text="📊 Calcul des agrégats...")
+                    from ppt_engine import MediaCalculator as _MC, generate_comments_via_claude, PPTInjector
+                    ss_val = list(sous_secteur_val) if sous_secteur_val else None
+                    calc = _MC(df_raw, secteur_sel, ss_val)
                     if not calc.years:
                         st.error("Aucune donnée pour ce filtre.")
                         return
                     stats = calc.summary_stats()
 
-                    # Commentaires IA
-                    progress.progress(50, text="🤖 Génération des commentaires IA...")
-                    from ppt_engine import generate_comments_via_claude
+                    # Label
                     if sous_secteur_val and len(sous_secteur_val) == 1:
                         label = sous_secteur_val[0]
                     elif sous_secteur_val and len(sous_secteur_val) > 1:
                         label = " + ".join(sous_secteur_val)
                     else:
                         label = secteur_sel
+
+                    # Commentaires IA
+                    progress.progress(40, text="🤖 Génération des commentaires IA...")
                     effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
                     comments = generate_comments_via_claude(stats, secteur_sel, label, effective_api_key)
 
-                    # Injection PPT
-                    progress.progress(75, text="💉 Injection dans le template PPT...")
-                    from ppt_engine import PPTInjector
-                    injector = PPTInjector(template_path)
+                    # Template — chargé depuis cache (lecture disque évitée si déjà lu)
+                    progress.progress(70, text="💉 Injection dans le template PPT...")
+                    tpl_bytes = _load_template(template_path)
+                    injector = PPTInjector.__new__(PPTInjector)
+                    injector.template_path = template_path
+                    injector.template_raw = tpl_bytes
                     pptx_bytes = injector.generate(calc, comments, secteur_sel, label)
 
                     progress.progress(100, text="✅ Terminé !")
