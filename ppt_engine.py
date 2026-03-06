@@ -474,21 +474,63 @@ def process_chart_annual(chart_xml: bytes, cats: list, vals: list, label: str) -
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+def _col_letter(idx: int) -> str:
+    """Convertit un index 0-based en lettre de colonne Excel (0→A, 1→B, 25→Z, 26→AA)."""
+    result = ""
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _fix_stacked_formulas(ser_el, series_idx: int, n_rows: int):
+    """
+    Réécrit les formules d'une série stacked avec la bonne lettre de colonne.
+    Colonne A = catégories, colonnes B+ = séries (idx 0 → B, idx 1 → C, etc.)
+    """
+    # Colonne données = B pour idx=0, C pour idx=1, D pour idx=2, E pour idx=3...
+    data_col = _col_letter(series_idx + 1)   # +1 car col A = catégories
+    header_col = data_col
+    cat_col = "A"
+
+    for f_el in ser_el.findall(f".//{ctag('f')}"):
+        txt = f_el.text or ""
+        # Extraire le nom de la feuille (ex: "Feuil1" ou "Sheet1")
+        sheet = txt.split("!")[0] if "!" in txt else "Sheet1"
+        # Header de la série : Feuil1!$B$1
+        if re.search(r'\$[A-Z]+\$1$', txt):
+            f_el.text = f"{sheet}!${header_col}$1"
+        # Range catégories : Feuil1!$A$2:$A$N
+        elif re.search(r'\$A\$\d+:\$A\$\d+', txt):
+            f_el.text = f"{sheet}!${cat_col}$2:${cat_col}${n_rows + 1}"
+        # Range valeurs : Feuil1!$X$2:$X$N
+        elif re.search(r'\$[A-Z]+\$\d+:\$[A-Z]+\$\d+', txt):
+            f_el.text = f"{sheet}!${data_col}$2:${data_col}${n_rows + 1}"
+
+
 def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFrame) -> bytes:
     root = etree.fromstring(chart_xml)
     bar_chart = root.find(f".//{ctag('barChart')}")
     if bar_chart is None:
         return chart_xml
+
     media_order = [m for m in ["AF","PR","RD","TV","CN"]
                    if m in media_matrix.columns and media_matrix[m].sum() > 0]
+    n_years = len(years)
+
     existing_sers = bar_chart.findall(ctag("ser"))
     ref_ser = existing_sers[0] if existing_sers else None
     for s in existing_sers:
         bar_chart.remove(s)
+
     _ib = bar_chart.find(ctag("dLbls"))
     insert_before = _ib if _ib is not None else bar_chart.find(ctag("axId"))
+
     extra_colors = {"TV": "2563EB", "CN": "70AD47"}
+
     for idx, m in enumerate(media_order):
+        # Cloner depuis la série template correspondante (ou ref_ser si pas assez)
         orig_idx = ["AF","PR","RD","TV","CN"].index(m)
         if orig_idx < len(existing_sers):
             new_ser = deepcopy(existing_sers[orig_idx])
@@ -498,16 +540,27 @@ def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFr
                 _set_series_color(new_ser, extra_colors[m])
         else:
             new_ser = etree.SubElement(bar_chart, ctag("ser"))
+
+        # idx / order
         idx_el = new_ser.find(ctag("idx"))
         if idx_el is None: idx_el = etree.SubElement(new_ser, ctag("idx"))
         idx_el.set("val", str(idx))
         order_el = new_ser.find(ctag("order"))
         if order_el is None: order_el = etree.SubElement(new_ser, ctag("order"))
         order_el.set("val", str(idx))
+
+        # Nom de la série
         _set_series_name(new_ser, m)
+
+        # Valeurs (en millions pour cohérence avec embedding)
         vals = [media_matrix.loc[y, m] if y in media_matrix.index else 0 for y in years]
         vals_clean = [v if v and v > 0 else None for v in vals]
         _rebuild_cache(new_ser, [int(y) for y in years], vals_clean, divide_by=1e6)
+
+        # ── Corriger les formules avec la bonne lettre de colonne ──
+        _fix_stacked_formulas(new_ser, idx, n_years)
+
+        # dLbls : afficher % centré dans la barre
         dlbls = new_ser.find(ctag("dLbls"))
         if dlbls is None: dlbls = etree.SubElement(new_ser, ctag("dLbls"))
         for child in list(dlbls): dlbls.remove(child)
@@ -516,10 +569,13 @@ def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFr
         for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
                          ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
             etree.SubElement(dlbls, ctag(tag)).set("val", val)
+
         if insert_before is not None:
             bar_chart.insert(list(bar_chart).index(insert_before), new_ser)
         else:
             bar_chart.append(new_ser)
+
+    # dLbls globaux
     gdlbls = bar_chart.find(ctag("dLbls"))
     if gdlbls is None: gdlbls = etree.SubElement(bar_chart, ctag("dLbls"))
     for child in list(gdlbls): gdlbls.remove(child)
@@ -529,6 +585,7 @@ def process_chart_stacked(chart_xml: bytes, years: list, media_matrix: pd.DataFr
     for tag, val in [("showLegendKey","0"),("showVal","0"),("showCatName","0"),
                      ("showSerName","0"),("showPercent","1"),("showBubbleSize","0")]:
         etree.SubElement(gdlbls, ctag(tag)).set("val", val)
+
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
